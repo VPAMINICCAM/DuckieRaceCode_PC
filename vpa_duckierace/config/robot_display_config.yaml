@@ -1,0 +1,7 @@
+robots:
+  fiona:
+    display_name: ROBOT1
+    color: blue
+  lucas:
+    display_name: ROBOT2
+    color: dark green

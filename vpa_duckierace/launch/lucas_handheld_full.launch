@@ -1,0 +1,20 @@
+<launch>
+  <!--
+    Full single-command startup for lucas handheld control on the main PC.
+    roslaunch will start roscore automatically if no local master is running.
+  -->
+  <arg name="pi_password" default="vpaduck" />
+  <arg name="ssh_user" default="vpaadmin" />
+
+  <include file="$(find vpa_duckierace)/launch/racecontrol_camera.launch" />
+  <include file="$(find vpa_duckierace)/launch/zone_manager.launch" />
+
+  <node name="start_lucas_handheld"
+        pkg="vpa_duckierace"
+        type="start_sciencenight_handheld.py"
+        output="screen"
+        required="true"
+        args="--robots lucas --skip-gui --skip-zone-manager --ssh-user $(arg ssh_user)">
+    <env name="PI_PASSWORD" value="$(arg pi_password)" />
+  </node>
+</launch>

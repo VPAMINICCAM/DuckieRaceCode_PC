@@ -1,0 +1,6 @@
+<launch>
+    <node pkg="joy" type="joy_node" name="joy_node" output="screen">
+    </node>
+    <node pkg="vpa_trafficsignal" type="joy_global_brake.py" name="joy_global_brake" output="screen">
+    </node>
+</launch>

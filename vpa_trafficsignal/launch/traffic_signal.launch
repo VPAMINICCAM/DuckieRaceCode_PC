@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="vpa_trafficsignal" type="traffic_signal_cycle_node.py" name="traffic_signal_cycle_node" output="screen"/>
+</launch>

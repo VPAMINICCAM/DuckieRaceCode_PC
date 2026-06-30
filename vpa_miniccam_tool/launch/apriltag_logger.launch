@@ -1,0 +1,17 @@
+<launch>
+  <!-- USB camera node -->
+  <node name="usb_cam" pkg="usb_cam" type="usb_cam_node" output="screen">
+    <param name="video_device" value="/dev/video0" />
+    <param name="image_width" value="1920" />
+    <param name="image_height" value="1080" />
+    <param name="pixel_format" value="yuyv" />
+    <param name="camera_frame_id" value="usb_cam" />
+    <param name="io_method" value="mmap" />
+  </node>
+
+  <!-- AprilTag logger script -->
+  <!-- <node name="apriltag_logger" pkg="vpa_miniccam_tool" type="apriltag_log.py" output="screen" respawn="false">
+  </node>
+  <node name="imu_logger" pkg='vpa_miniccam_tool' type="log_imu_ticks.py" output='screen'>
+  </node> -->
+</launch>

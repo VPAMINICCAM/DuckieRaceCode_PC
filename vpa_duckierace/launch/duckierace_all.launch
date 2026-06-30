@@ -1,0 +1,22 @@
+<launch>
+  <arg name="global_brake" default="false" />
+  <arg name="fiona_mode" default="manual" />
+  <arg name="lucas_mode" default="manual" />
+  <arg name="control_rate" default="2.0" />
+  <arg name="all_robots" default="[fiona, lucas]" />
+
+  <include file="$(find vpa_duckierace)/launch/start_racecontrol.launch" />
+
+  <include file="$(find vpa_duckierace)/launch/virtual_driver.launch">
+    <arg name="fiona_mode" value="$(arg fiona_mode)" />
+    <arg name="lucas_mode" value="$(arg lucas_mode)" />
+    <arg name="control_rate" value="$(arg control_rate)" />
+    <arg name="all_robots" value="$(arg all_robots)" />
+  </include>
+
+  <node name="global_brake_latch"
+        pkg="vpa_duckierace" type="global_brake_latch.py"
+        output="screen">
+    <param name="brake" value="$(arg global_brake)" />
+  </node>
+</launch>

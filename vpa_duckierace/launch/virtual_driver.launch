@@ -1,0 +1,72 @@
+<launch>
+  <!--
+    virtual_driver.launch
+    =====================
+    Launches one VirtualDriver node per robot on the MAIN PC.
+    Each node publishes synthetic Joy messages to /{robot_name}/joy so that
+    the robot's duckierace.py processes them exactly like physical joystick input.
+
+    IMPORTANT: When using virtual drivers, do NOT run joy_node on the robots
+    (or ensure no physical joystick is plugged in), otherwise both sources
+    will publish to the same /joy topic simultaneously.
+
+    Behaviour modes
+    ===============
+      manual       - virtual driver is silent; physical joystick is in control
+      conservative - low speed, charges whenever in the fuel zone
+      aggressive   - max speed, charges only when critically low
+      cooperative  - medium speed, yields at obstacles, shares fuel zone fairly
+      adaptive     - switches strategy automatically based on power level
+
+    Usage examples
+    ==============
+    # All robots in cooperative mode (Phase-2 demo):
+      roslaunch vpa_duckierace virtual_driver.launch fiona_mode:=cooperative lucas_mode:=cooperative
+
+    # All robots in aggressive mode (Phase-1 / selfish baseline):
+      roslaunch vpa_duckierace virtual_driver.launch fiona_mode:=aggressive lucas_mode:=aggressive
+
+    # Override one robot individually (run in separate terminal):
+      rosrun vpa_duckierace virtual_driver_node.py
+        __name:=vd_lucas _robot_name:=lucas _driving_mode:=adaptive
+
+    Runtime mode switching (no restart needed):
+      rostopic pub /lucas/set_driving_mode std_msgs/String "data: 'cooperative'"
+  -->
+
+  <arg name="fiona_mode" default="conservative"
+       doc="Initial behavior mode for fiona: manual|conservative|aggressive|cooperative|adaptive" />
+  <arg name="lucas_mode" default="conservative"
+       doc="Initial behavior mode for lucas: manual|conservative|aggressive|cooperative|adaptive" />
+  <arg name="control_rate" default="2.0"
+       doc="Control loop frequency [Hz]. Keep at most 1/0.3 ~= 3.3 to match duckierace debounce." />
+
+  <!-- Shared robot list (active DuckieRace robots) -->
+  <arg name="all_robots" default="[fiona, lucas]" />
+  <arg name="camera_names" default="[usb_cam_1, usb_cam_2]" />
+  <arg name="charge_camera_names" default="[usb_cam_2]" />
+
+  <!-- fiona -->
+  <node name="virtual_driver_fiona"
+        pkg="vpa_duckierace" type="virtual_driver_node.py"
+        output="screen" required="false">
+    <param name="robot_name"   value="fiona" />
+    <param name="driving_mode" value="$(arg fiona_mode)" />
+    <param name="control_rate" value="$(arg control_rate)" />
+    <rosparam param="all_robots" subst_value="True">$(arg all_robots)</rosparam>
+    <rosparam param="camera_names" subst_value="True">$(arg camera_names)</rosparam>
+    <rosparam param="charge_camera_names" subst_value="True">$(arg charge_camera_names)</rosparam>
+  </node>
+
+  <!-- lucas -->
+  <node name="virtual_driver_lucas"
+        pkg="vpa_duckierace" type="virtual_driver_node.py"
+        output="screen" required="false">
+    <param name="robot_name"   value="lucas" />
+    <param name="driving_mode" value="$(arg lucas_mode)" />
+    <param name="control_rate" value="$(arg control_rate)" />
+    <rosparam param="all_robots" subst_value="True">$(arg all_robots)</rosparam>
+    <rosparam param="camera_names" subst_value="True">$(arg camera_names)</rosparam>
+    <rosparam param="charge_camera_names" subst_value="True">$(arg charge_camera_names)</rosparam>
+  </node>
+</launch>

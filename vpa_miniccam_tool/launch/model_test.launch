@@ -1,0 +1,8 @@
+<launch>
+    <!-- <node pkg="vpa_miniccam_tool" type="model_test.py" name="model_test" output="screen">
+    </node> -->
+    <node pkg="vpa_miniccam_tool" type="model_test_2.py" name="model_test" output="screen">
+    </node>   
+    <node pkg="vpa_miniccam_tool" type="log_imu_ticks.py" name="log_imu_ticks" output="screen">
+    </node>
+</launch>

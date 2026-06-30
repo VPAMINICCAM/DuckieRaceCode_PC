@@ -1,0 +1,27 @@
+<!-- File: launch/cam_zone_manager.launch -->
+<launch>
+  <!-- Arguments -->
+  <arg name="camera_config" default="$(find vpa_duckierace)/config/camera.yaml"/>
+  <arg name="tag_robot_map" default="$(find vpa_duckierace)/config/tag_robot_map.yaml"/>
+  <arg name="zone_config_path1" default="$(find vpa_duckierace)/config/zones_cam1.yaml"/>
+  <arg name="zone_config_path2" default="$(find vpa_duckierace)/config/zones_cam2.yaml"/>
+
+  <node name="zone_state_aggregator" pkg="vpa_duckierace" type="zone_state_aggregator.py" output="screen">
+    <param name="robot_tag_config_path" value="$(arg tag_robot_map)" />
+    <param name="fuel_hold_sec" value="0.5" />
+    <rosparam param="camera_names">[usb_cam_1, usb_cam_2]</rosparam>
+    <rosparam param="fuel_camera_names">[usb_cam_2]</rosparam>
+  </node>
+
+  <!-- Camera Zone Manager Node -->
+  <node name="cam_zone_manager1" pkg="vpa_duckierace" type="cam_zone_manager.py" output="screen">
+    <param name="cam_config_path" value="$(arg camera_config)" />
+    <param name="robot_tag_config_path" value="$(arg tag_robot_map)" />
+    <param name="zone_config_path" value="$(arg zone_config_path1)" />
+  </node>
+  <node name="cam_zone_manager2" pkg="vpa_duckierace" type="cam_zone_manager.py" output="screen">
+    <param name="cam_config_path" value="$(arg camera_config)" />
+    <param name="robot_tag_config_path" value="$(arg tag_robot_map)" />
+    <param name="zone_config_path" value="$(arg zone_config_path2)" />
+    </node>
+</launch>

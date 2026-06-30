@@ -1,0 +1,4 @@
+<launch>
+    <include file="$(find vpa_duckierace)/launch/racecontrol_camera.launch" />
+    <include file="$(find vpa_duckierace)/launch/zone_manager.launch" />
+</launch>

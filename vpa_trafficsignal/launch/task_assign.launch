@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="vpa_trafficsignal" type="task_assign_node.py" name="task_assign_node" output="screen"/>
+</launch>

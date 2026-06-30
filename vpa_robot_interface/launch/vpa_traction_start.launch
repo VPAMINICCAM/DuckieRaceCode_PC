@@ -1,0 +1,14 @@
+<launch>
+    <arg name="throttle_input" default="False"/>
+    <arg name="dyna_trim" default="False"/>
+
+    <node name="traction_wheels" pkg="vpa_robot_interface" type="wheel_driver.py" output="screen" required="true">
+        <param name="direct_mode" value="$(arg throttle_input)"/>
+        <param name="dyna_trim" value="$(arg dyna_trim)"/>
+    </node>
+    <node name="traction_encoders" pkg="vpa_robot_interface" type="wheel_encoders.py" output="screen" required="true"/>
+
+    <group if="$(arg dyna_trim)">
+        <include file="$(find vpa_robot_interface)/launch/vpa_imu.launch"/>
+    </group>
+</launch>

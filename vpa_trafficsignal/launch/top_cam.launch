@@ -1,0 +1,23 @@
+<launch>
+    <!-- Launch the usb_cam node -->
+    <node name="usb_cam" pkg="usb_cam" type="usb_cam_node" output="screen">
+        <!-- Set the device to /dev/video0 -->
+        <param name="video_device" value="/dev/video0" />
+
+        <!-- Set the resolution to 1080p -->
+        <param name="image_width" value="1920" />
+        <param name="image_height" value="1080" />
+
+        <!-- Set the pixel format -->
+        <param name="pixel_format" value="yuyv" />
+
+        <!-- Set the I/O method -->
+        <param name="io_method" value="mmap" />
+
+        <!-- Set the frame rate -->
+        <param name="framerate" value="30" />
+
+        <!-- Set the camera name -->
+        <param name="camera_name" value="top_cam" />
+    </node>
+</launch>
