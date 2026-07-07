@@ -27,6 +27,7 @@ Merge zone (single rectangle, axis-aligned):
 - width  = fuel_long_len / 3
 - height = 3 * fuel_short_len
 
+
 Charge gate zone (single rectangle, axis-aligned, left of fuel):
 - right side x_max = fuel_x_min - GATE_RIGHT_RATIO * fuel_long_len
 - gate is square: side = GATE_SHORT_K * fuel_short_len

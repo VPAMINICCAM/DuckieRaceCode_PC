@@ -2,7 +2,7 @@
 
 import rospy
 import yaml
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32
 
 
 class ZoneStateAggregator:
@@ -15,13 +15,18 @@ class ZoneStateAggregator:
 
         self.camera_names = rospy.get_param("~camera_names", ["usb_cam_1", "usb_cam_2"])
         self.fuel_camera_names = rospy.get_param("~fuel_camera_names", ["usb_cam_2"])
+        self.lap_camera_names = rospy.get_param("~lap_camera_names", ["usb_cam_2"])
         self.fuel_hold_sec = float(rospy.get_param("~fuel_hold_sec", 0.5))
         self.states = {}
         self.last_fuel_true = {}
+        self.lap_counts = {}
+        self.lap_zone_seen = {}
+        self.lap_zone_active = {}
         self.fuel_pubs = {}
         self.merge_pubs = {}
         self.charge_gate_pubs = {}
         self.tag_visible_pubs = {}
+        self.lap_pubs = {}
 
         for robot_name in robot_tags:
             self.states[robot_name] = {
@@ -31,6 +36,9 @@ class ZoneStateAggregator:
                 "tag_visible": {cam: False for cam in self.camera_names},
             }
             self.last_fuel_true[robot_name] = None
+            self.lap_counts[robot_name] = 0.0
+            self.lap_zone_seen[robot_name] = {"charge_gate": False, "merge": False}
+            self.lap_zone_active[robot_name] = {"charge_gate": False, "merge": False}
             self.fuel_pubs[robot_name] = rospy.Publisher(
                 f"/{robot_name}/in_fuel_zone", Bool, queue_size=1
             )
@@ -42,6 +50,9 @@ class ZoneStateAggregator:
             )
             self.tag_visible_pubs[robot_name] = rospy.Publisher(
                 f"/{robot_name}/tag_visible", Bool, queue_size=1
+            )
+            self.lap_pubs[robot_name] = rospy.Publisher(
+                f"/{robot_name}/lap_count", Float32, queue_size=1, latch=True
             )
 
             for cam in self.camera_names:
@@ -66,11 +77,14 @@ class ZoneStateAggregator:
                     self._make_callback(robot_name, cam, "tag_visible"),
                 )
 
+        rospy.Subscriber("/reset_laps", Bool, self._reset_laps)
+
         rospy.loginfo(
-            "ZoneStateAggregator started for robots=%s cameras=%s fuel_cameras=%s",
+            "ZoneStateAggregator started for robots=%s cameras=%s fuel_cameras=%s lap_cameras=%s",
             list(robot_tags.keys()),
             self.camera_names,
             self.fuel_camera_names,
+            self.lap_camera_names,
         )
 
     def _make_callback(self, robot_name, camera_name, field):
@@ -95,8 +109,45 @@ class ZoneStateAggregator:
                     self.charge_gate_pubs[robot_name].publish(Bool(data=value))
                 else:
                     self.tag_visible_pubs[robot_name].publish(Bool(data=value))
+                if field in ("charge_gate", "merge"):
+                    self._update_lap_zone(robot_name, field)
 
         return callback
+
+    def _update_lap_zone(self, robot_name, field):
+        value = self._lap_zone_value(robot_name, field)
+        was_active = self.lap_zone_active[robot_name][field]
+        self.lap_zone_active[robot_name][field] = value
+        if not value or was_active:
+            return
+
+        self.lap_zone_seen[robot_name][field] = True
+        seen = self.lap_zone_seen[robot_name]
+        if seen["charge_gate"] and seen["merge"]:
+            self.lap_counts[robot_name] += 1.0
+            self.lap_pubs[robot_name].publish(Float32(data=self.lap_counts[robot_name]))
+            seen["charge_gate"] = False
+            seen["merge"] = False
+            rospy.loginfo("%s completed lap %.0f", robot_name, self.lap_counts[robot_name])
+
+    def _lap_zone_value(self, robot_name, field):
+        return any(
+            self.states[robot_name][field].get(cam, False)
+            for cam in self.lap_camera_names
+        )
+
+    def _reset_laps(self, msg):
+        if not msg.data:
+            return
+        for robot_name in self.lap_counts:
+            self.lap_counts[robot_name] = 0.0
+            self.lap_zone_seen[robot_name] = {"charge_gate": False, "merge": False}
+            self.lap_zone_active[robot_name] = {
+                "charge_gate": self._lap_zone_value(robot_name, "charge_gate"),
+                "merge": self._lap_zone_value(robot_name, "merge"),
+            }
+            self.lap_pubs[robot_name].publish(Float32(data=0.0))
+        rospy.loginfo("Reset aggregated lap counts")
 
 
 if __name__ == "__main__":

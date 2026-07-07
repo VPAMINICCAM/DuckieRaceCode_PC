@@ -37,16 +37,14 @@ class RaceGUI:
                 'total_charged_energy': 0.0,
                 'charging_events': 0,
                 'charging_active': False,
-                'laps1': 0,
-                'laps2': 0
+                'laps': 0.0
             }
             rospy.Subscriber(f"/{name}/power_level", Float32, self.make_callback(name, 'power'))
             rospy.Subscriber(f"/{name}/speed_percent", Float32, self.make_callback(name, 'speed'))
             rospy.Subscriber(f"/{name}/local_brake", Bool, self.make_callback(name, 'brake'))
             rospy.Subscriber(f"/{name}/in_fuel_zone", Bool, self.make_callback(name, 'in_fuel'))
             rospy.Subscriber(f"/{name}/in_charge_gate_zone", Bool, self.make_callback(name, 'in_charge_gate'))
-            rospy.Subscriber(f"/{name}/usb_cam_1/lap_count", Float32, self.make_callback(name, 'laps1'))
-            rospy.Subscriber(f"/{name}/usb_cam_2/lap_count", Float32, self.make_callback(name, 'laps2'))
+            rospy.Subscriber(f"/{name}/lap_count", Float32, self.make_callback(name, 'laps'))
 
         self.global_brake_pub = rospy.Publisher("/global_brake", Bool, queue_size=1, latch=True)
         self.global_brake_pub.publish(Bool(data=True))
@@ -78,7 +76,7 @@ class RaceGUI:
         def callback(msg):
             if field == 'power':
                 self.update_power_stats(robot_name, msg.data)
-            elif field in ['speed','laps1', 'laps2']:
+            elif field in ['speed', 'laps']:
                 self.robot_states[robot_name][field] = msg.data
             else:
                 self.robot_states[robot_name][field] = msg.data
@@ -131,8 +129,7 @@ class RaceGUI:
 
     def reset_laps(self):
         for state in self.robot_states.values():
-            state['laps1'] = 0
-            state['laps2'] = 0
+            state['laps'] = 0.0
         for _ in range(3):
             self.reset_laps_pub.publish(Bool(data=True))
 
@@ -238,7 +235,7 @@ class RaceGUI:
                 verticalalignment='center')
 
             # Lap counter
-            self.ax.text(1.08, y, f"Laps: {state['laps1']+state['laps2']}", fontsize=14, verticalalignment='center')
+            self.ax.text(1.08, y, f"Laps: {state['laps']:.0f}", fontsize=14, verticalalignment='center')
 
 
 if __name__ == '__main__':
