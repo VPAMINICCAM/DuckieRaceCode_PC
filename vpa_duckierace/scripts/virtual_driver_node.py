@@ -112,6 +112,14 @@ AGGRESSIVE_BATTERY_PER_LAP_DEFAULT = 20.0
 AGGRESSIVE_BATTERY_RESERVE = 10.0
 AGGRESSIVE_LAP_EMA_ALPHA = 0.35
 AGGRESSIVE_MIN_VALID_LAP_DROP = 1.0
+AGGRESSIVE_CHARGE_START_MARGIN = 12.0
+AGGRESSIVE_DEFER_MARGIN = 6.0
+AGGRESSIVE_PRIORITY_EPSILON = 2.0
+AGGRESSIVE_PEER_LOW_POWER = 60.0
+AGGRESSIVE_NORMAL_CHARGE_TARGET = 90.0
+AGGRESSIVE_PRESSURE_CHARGE_TARGET = 55.0
+AGGRESSIVE_URGENT_CHARGE_TARGET = 65.0
+AGGRESSIVE_CHARGE_TARGET_MARGIN = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +176,12 @@ class DrivingStrategyBase:
     def waits_for_merge_occupancy(self, driver) -> bool:
         return True
 
+    def defers_charge_for_peer(self, driver) -> bool:
+        return False
+
+    def waits_for_charge_gate_priority(self, driver) -> bool:
+        return False
+
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
         return actions.idle()
 
@@ -180,6 +194,15 @@ class DrivingStrategyBase:
         if driver.seeking_fuel:
             if driver.in_fuel_zone:
                 driver.seeking_fuel = False
+            elif (self.waits_for_fuel_occupancy(driver)
+                    and driver._active_charge_fuel_occupied_by_other()):
+                driver.seeking_fuel = False
+                driver.gate_release_sent = False
+                return actions.wait_at_charge_gate()
+            elif self.defers_charge_for_peer(driver):
+                driver.seeking_fuel = False
+                driver.gate_release_sent = False
+                return self.normal_drive(driver, actions)
             else:
                 return actions.slow_for_charge_gate()
 
@@ -209,7 +232,8 @@ class DrivingStrategyBase:
                 and driver._at_charge_gate()
                 and not driver.in_fuel_zone):
             if (self.waits_for_fuel_occupancy(driver)
-                    and driver._active_charge_fuel_occupied_by_other()):
+                    and (driver._active_charge_fuel_occupied_by_other()
+                         or self.waits_for_charge_gate_priority(driver))):
                 driver.gate_release_sent = False
                 return actions.wait_at_charge_gate()
             if driver.local_brake:
@@ -238,10 +262,22 @@ class ConservativeStrategy(DrivingStrategyBase):
 
 class AggressiveStrategy(DrivingStrategyBase):
     def wants_charge(self, driver) -> bool:
-        return (
-            driver.power_level < POWER_CRITICAL
-            or driver.power_level <= driver.aggressive_required_power()
-        )
+        if driver.power_level < POWER_CRITICAL:
+            return True
+        if driver.power_level <= driver.aggressive_hard_charge_threshold():
+            return True
+        if driver.power_level <= driver.aggressive_charge_start_threshold():
+            return not driver._aggressive_should_defer_charge()
+        return False
+
+    def charge_target_power(self, driver) -> float:
+        return driver.aggressive_charge_target_power()
+
+    def defers_charge_for_peer(self, driver) -> bool:
+        return driver._aggressive_should_defer_charge()
+
+    def waits_for_charge_gate_priority(self, driver) -> bool:
+        return driver._aggressive_peer_has_gate_priority()
 
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
         buttons = [0] * 12
@@ -340,6 +376,28 @@ class VirtualDriver:
         self.aggressive_battery_per_lap_estimate = float(rospy.get_param(
             "~aggressive_battery_per_lap_default",
             AGGRESSIVE_BATTERY_PER_LAP_DEFAULT))
+        self.aggressive_charge_start_margin = float(rospy.get_param(
+            "~aggressive_charge_start_margin",
+            AGGRESSIVE_CHARGE_START_MARGIN))
+        self.aggressive_defer_margin = float(rospy.get_param(
+            "~aggressive_defer_margin", AGGRESSIVE_DEFER_MARGIN))
+        self.aggressive_priority_epsilon = float(rospy.get_param(
+            "~aggressive_priority_epsilon",
+            AGGRESSIVE_PRIORITY_EPSILON))
+        self.aggressive_peer_low_power = float(rospy.get_param(
+            "~aggressive_peer_low_power", AGGRESSIVE_PEER_LOW_POWER))
+        self.aggressive_normal_charge_target = float(rospy.get_param(
+            "~aggressive_normal_charge_target",
+            AGGRESSIVE_NORMAL_CHARGE_TARGET))
+        self.aggressive_pressure_charge_target = float(rospy.get_param(
+            "~aggressive_pressure_charge_target",
+            AGGRESSIVE_PRESSURE_CHARGE_TARGET))
+        self.aggressive_urgent_charge_target = float(rospy.get_param(
+            "~aggressive_urgent_charge_target",
+            AGGRESSIVE_URGENT_CHARGE_TARGET))
+        self.aggressive_charge_target_margin = float(rospy.get_param(
+            "~aggressive_charge_target_margin",
+            AGGRESSIVE_CHARGE_TARGET_MARGIN))
 
         try:
             self.mode = DrivingMode(mode_str.strip().lower())
@@ -695,6 +753,94 @@ class VirtualDriver:
             self.aggressive_battery_per_lap_estimate
             + self.aggressive_battery_reserve
         )
+
+    def aggressive_hard_charge_threshold(self) -> float:
+        return max(POWER_CRITICAL, self.aggressive_required_power())
+
+    def aggressive_charge_start_threshold(self) -> float:
+        return (
+            self.aggressive_hard_charge_threshold()
+            + self.aggressive_charge_start_margin
+        )
+
+    def aggressive_can_defer_charge(self) -> bool:
+        return (
+            self.power_level
+            > self.aggressive_hard_charge_threshold()
+            + self.aggressive_defer_margin
+        )
+
+    def aggressive_charge_target_power(self) -> float:
+        hard_target = (
+            self.aggressive_hard_charge_threshold()
+            + self.aggressive_charge_target_margin
+        )
+
+        if self._aggressive_peer_charge_pressure():
+            if self.power_level <= self.aggressive_hard_charge_threshold():
+                return min(
+                    self.aggressive_normal_charge_target,
+                    max(self.aggressive_urgent_charge_target, hard_target))
+            return min(
+                self.aggressive_normal_charge_target,
+                max(self.aggressive_pressure_charge_target, hard_target))
+
+        return self.aggressive_normal_charge_target
+
+    def _aggressive_peer_charge_pressure(self) -> bool:
+        for robot in self.other_robots:
+            if self.other_in_fuel.get(robot, False):
+                return True
+            if self.other_in_charge_gate.get(robot, False):
+                return True
+            if self.other_power.get(robot, 100.0) <= self.aggressive_peer_low_power:
+                return True
+        return False
+
+    def _aggressive_peer_urgency(self, power_level: float) -> float:
+        return self.aggressive_hard_charge_threshold() - power_level
+
+    def _aggressive_peer_has_priority(self, robot: str) -> bool:
+        peer_power = self.other_power.get(robot, 100.0)
+        peer_urgency = self._aggressive_peer_urgency(peer_power)
+        self_urgency = self._aggressive_peer_urgency(self.power_level)
+        epsilon = self.aggressive_priority_epsilon
+
+        if peer_urgency > self_urgency + epsilon:
+            return True
+        if self_urgency > peer_urgency + epsilon:
+            return False
+        if peer_power < self.power_level - epsilon:
+            return True
+        if self.power_level < peer_power - epsilon:
+            return False
+        return robot < self.robot_name
+
+    def _aggressive_should_defer_charge(self) -> bool:
+        if not self.aggressive_can_defer_charge():
+            return False
+
+        for robot in self.other_robots:
+            peer_low = (
+                self.other_power.get(robot, 100.0)
+                <= self.aggressive_charge_start_threshold()
+            )
+            peer_present = (
+                self.other_in_fuel.get(robot, False)
+                or self.other_in_charge_gate.get(robot, False)
+            )
+            if (peer_low or peer_present) and self._aggressive_peer_has_priority(robot):
+                return True
+
+        return False
+
+    def _aggressive_peer_has_gate_priority(self) -> bool:
+        for robot in self.other_robots:
+            if (
+                    self.other_in_charge_gate.get(robot, False)
+                    and self._aggressive_peer_has_priority(robot)):
+                return True
+        return False
 
     def _aggressive_front_safety_state(self) -> str:
         if self.front_range_stamp is None:
