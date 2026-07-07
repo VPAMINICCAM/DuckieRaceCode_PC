@@ -22,6 +22,7 @@ class RaceGUI:
         self.robots = config['robots']
         self.display_names = {k: v['display_name'] for k, v in self.robots.items()}
         self.charging_cost_per_percent = rospy.get_param("~charging_cost_per_percent", 2.0)
+        self.battery_milestones = [25, 50, 75, 90]
 
         self.robot_states = {}
         for name in self.robots:
@@ -37,7 +38,18 @@ class RaceGUI:
                 'total_charged_energy': 0.0,
                 'charging_events': 0,
                 'charging_active': False,
-                'laps': 0.0
+                'laps': 0.0,
+                'race_start_power': None,
+                'race_start_charged_energy': 0.0,
+                'last_lap_mark': 0.0,
+                'last_lap_time': None,
+                'last_lap_power': None,
+                'last_lap_charged_energy': 0.0,
+                'lap_times': [],
+                'lap_battery_used': [],
+                'battery_milestone_times': {
+                    milestone: None for milestone in self.battery_milestones
+                }
             }
             rospy.Subscriber(f"/{name}/power_level", Float32, self.make_callback(name, 'power'))
             rospy.Subscriber(f"/{name}/speed_percent", Float32, self.make_callback(name, 'speed'))
@@ -61,7 +73,7 @@ class RaceGUI:
         self.countdown_start = None
         self.start_time = None
 
-        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.fig, self.ax = plt.subplots(figsize=(11, 7))
         plt.subplots_adjust(top=0.8, right=0.75)
         self.anim = FuncAnimation(self.fig, self.update_gui, interval=200)
 
@@ -76,13 +88,20 @@ class RaceGUI:
         def callback(msg):
             if field == 'power':
                 self.update_power_stats(robot_name, msg.data)
-            elif field in ['speed', 'laps']:
+            elif field == 'laps':
+                self.update_lap_stats(robot_name, msg.data)
+            elif field == 'speed':
                 self.robot_states[robot_name][field] = msg.data
             else:
                 self.robot_states[robot_name][field] = msg.data
                 if field == 'in_fuel' and not msg.data:
                     self.robot_states[robot_name]['charging_active'] = False
         return callback
+
+    def race_elapsed(self):
+        if self.start_time is None:
+            return None
+        return time.time() - self.start_time
 
     def update_power_stats(self, robot_name, power):
         state = self.robot_states[robot_name]
@@ -100,7 +119,107 @@ class RaceGUI:
                 state['charging_active'] = True
         elif not state['in_fuel']:
             state['charging_active'] = False
+        self.update_battery_milestones(state)
         state['last_power'] = power
+
+    def update_lap_stats(self, robot_name, laps):
+        state = self.robot_states[robot_name]
+        state['laps'] = laps
+
+        if self.state != 'running' or self.start_time is None:
+            state['last_lap_mark'] = laps
+            return
+
+        if laps <= state['last_lap_mark']:
+            return
+
+        now = time.time()
+        last_lap_time = state['last_lap_time']
+        if last_lap_time is None:
+            last_lap_time = self.start_time
+
+        lap_delta = laps - state['last_lap_mark']
+        elapsed = max(0.0, now - last_lap_time)
+        lap_seconds = elapsed / lap_delta if lap_delta > 0.0 else elapsed
+
+        last_lap_power = state['last_lap_power']
+        if last_lap_power is None:
+            last_lap_power = state['race_start_power']
+        if last_lap_power is None:
+            last_lap_power = state['power']
+
+        charged_delta = (
+            state['total_charged_energy']
+            - state['last_lap_charged_energy']
+        )
+        battery_used = max(0.0, last_lap_power - state['power'] + charged_delta)
+        battery_per_lap = battery_used / lap_delta if lap_delta > 0.0 else battery_used
+
+        completed_laps = max(1, int(round(lap_delta)))
+        for _ in range(completed_laps):
+            state['lap_times'].append(lap_seconds)
+            state['lap_battery_used'].append(battery_per_lap)
+
+        state['last_lap_mark'] = laps
+        state['last_lap_time'] = now
+        state['last_lap_power'] = state['power']
+        state['last_lap_charged_energy'] = state['total_charged_energy']
+
+        rospy.loginfo(
+            "%s lap %.0f: %.1fs, %.1f%% battery",
+            robot_name,
+            laps,
+            lap_seconds,
+            battery_per_lap)
+
+    def update_battery_milestones(self, state):
+        if self.state != 'running' or state['race_start_power'] is None:
+            return
+
+        elapsed = self.race_elapsed()
+        if elapsed is None:
+            return
+
+        charged_since_start = (
+            state['total_charged_energy']
+            - state['race_start_charged_energy']
+        )
+        consumed = max(
+            0.0,
+            state['race_start_power'] - state['power'] + charged_since_start)
+        for milestone in self.battery_milestones:
+            if (
+                    state['battery_milestone_times'][milestone] is None
+                    and consumed >= milestone):
+                state['battery_milestone_times'][milestone] = elapsed
+
+    def reset_race_stats(self):
+        for state in self.robot_states.values():
+            state['race_start_power'] = None
+            state['race_start_charged_energy'] = state['total_charged_energy']
+            state['last_lap_mark'] = state['laps']
+            state['last_lap_time'] = None
+            state['last_lap_power'] = state['power']
+            state['last_lap_charged_energy'] = state['total_charged_energy']
+            state['lap_times'] = []
+            state['lap_battery_used'] = []
+            state['battery_milestone_times'] = {
+                milestone: None for milestone in self.battery_milestones
+            }
+
+    def start_race_stats(self):
+        for state in self.robot_states.values():
+            state['race_start_power'] = state['power']
+            state['race_start_charged_energy'] = state['total_charged_energy']
+            state['last_lap_mark'] = state['laps']
+            state['last_lap_time'] = self.start_time
+            state['last_lap_power'] = state['power']
+            state['last_lap_charged_energy'] = state['total_charged_energy']
+            state['lap_times'] = []
+            state['lap_battery_used'] = []
+            state['battery_milestone_times'] = {
+                milestone: None for milestone in self.battery_milestones
+            }
 
     def toggle_game(self, event):
         if self.state in ['waiting', 'running', 'finished']:
@@ -109,6 +228,7 @@ class RaceGUI:
                 self.reset_laps()
                 self.reset_charge_wait_times()
                 self.reset_charging_stats()
+                self.reset_race_stats()
                 self.countdown_start = time.time()
                 self.state = 'countdown'
                 self.toggle_button.label.set_text("Stop Game")
@@ -118,11 +238,13 @@ class RaceGUI:
                 self.global_brake_pub.publish(Bool(data=True))
                 self.reset_laps()
                 self.reset_power_speed()
+                self.reset_race_stats()
                 self.toggle_button.label.set_text("Start Game")
             elif self.state == 'finished':
                 self.reset_laps()
                 self.reset_charge_wait_times()
                 self.reset_charging_stats()
+                self.reset_race_stats()
                 self.countdown_start = time.time()
                 self.state = 'countdown'
                 self.toggle_button.label.set_text("Stop Game")
@@ -158,6 +280,25 @@ class RaceGUI:
             self.global_brake_pub.publish(Bool(data=True))
         self.toggle_button.label.set_text("Start Game")
 
+    @staticmethod
+    def format_seconds(value):
+        if value is None:
+            return "--"
+        return f"{value:.1f}s"
+
+    @staticmethod
+    def average(values):
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def format_milestones(self, state):
+        parts = []
+        for milestone in self.battery_milestones:
+            value = state['battery_milestone_times'][milestone]
+            parts.append(f"{milestone}:{self.format_seconds(value)}")
+        return "  ".join(parts)
+
     def update_gui(self, frame):
         self.ax.clear()
         self.ax.axis('off')
@@ -170,6 +311,7 @@ class RaceGUI:
             if seconds_left <= 0:
                 self.start_time = time.time()
                 self.state = 'running'
+                self.start_race_stats()
                 self.global_brake_pub.publish(Bool(data=False))
             title = f"Race Starting In: {max(seconds_left, 0)}s"
         elif self.state == 'running':
@@ -232,6 +374,33 @@ class RaceGUI:
                 0.38, y-0.09,
                 f"Charged: {state['total_charged_energy']:.1f}%  Cost: EUR {charging_cost:.2f}  Events: {state['charging_events']}",
                 fontsize=10,
+                verticalalignment='center')
+
+            last_lap_time = state['lap_times'][-1] if state['lap_times'] else None
+            avg_lap_time = self.average(state['lap_times'])
+            last_battery = (
+                state['lap_battery_used'][-1]
+                if state['lap_battery_used'] else None
+            )
+            avg_battery = self.average(state['lap_battery_used'])
+            self.ax.text(
+                0.05, y-0.13,
+                "Lap Time: last {}  avg {}".format(
+                    self.format_seconds(last_lap_time),
+                    self.format_seconds(avg_lap_time)),
+                fontsize=9,
+                verticalalignment='center')
+            self.ax.text(
+                0.38, y-0.13,
+                "Battery/Lap: last {}  avg {}".format(
+                    "--" if last_battery is None else f"{last_battery:.1f}%",
+                    "--" if avg_battery is None else f"{avg_battery:.1f}%"),
+                fontsize=9,
+                verticalalignment='center')
+            self.ax.text(
+                0.05, y-0.17,
+                f"Battery Used At: {self.format_milestones(state)}",
+                fontsize=9,
                 verticalalignment='center')
 
             # Lap counter

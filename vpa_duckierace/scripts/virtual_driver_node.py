@@ -10,7 +10,8 @@ Behavior Modes
 MANUAL       - Virtual driver is inactive; physical joystick is used instead.
 CONSERVATIVE - Low speed, charges whenever inside the fuel zone.
 AGGRESSIVE   - Max speed, charges only when power is critically low;
-               switches to yellow line to overtake slow robots ahead.
+               slows / overtakes based on front range and charges when the
+               learned one-lap battery budget is no longer available.
 COOPERATIVE  - Medium speed, yields at obstacles, shares the fuel zone fairly
                with the other robots.
 ADAPTIVE     - Switches automatically between aggressive / conservative based
@@ -20,14 +21,17 @@ ROS Interface
 -------------
 Subscribed topics (all absolute paths):
   /{robot_name}/power_level        Float32  Virtual power level (0-100 %)
+  /{robot_name}/speed_percent      Float32  Robot-reported target speed
   /{robot_name}/local_brake        Bool     Current local brake state
   /{robot_name}/in_fuel_zone       Bool     Whether robot is in the fuel zone
   /{robot_name}/in_charge_gate_zone Bool    Whether robot is at charge-gate entry
   /{robot_name}/in_merge_zone      Bool     Whether robot is in the merge zone
   /{robot_name}/front_range        Range    ToF distance to obstacle ahead
+  /{robot_name}/lap_count          Float32  Completed laps
   /{robot_name}/set_driving_mode   String   Runtime mode-change command
   /{other_robot}/power_level       Float32  Peer robots' power (cooperative mode)
   /{other_robot}/in_fuel_zone      Bool     Peer robots' fuel-zone occupancy
+  /{other_robot}/in_charge_gate_zone Bool    Peer robots' charge-gate occupancy
   /{other_robot}/in_merge_zone     Bool     Peer robots' merge-zone occupancy
   /global_brake                    Bool     Race-level start / stop signal
 
@@ -44,6 +48,7 @@ Parameters
 """
 
 import rospy
+import math
 from sensor_msgs.msg import Joy, Range
 from std_msgs.msg import Bool, Float32, String
 from enum import Enum
@@ -83,6 +88,7 @@ SPEED_MAX     = 0.35
 SPEED_MIN     = 0.20
 STEPS_TO_MAX  = int(round((SPEED_MAX - SPEED_START) / SPEED_STEP))  # 5
 STEPS_TO_MIN  = -int(round((SPEED_START - SPEED_MIN) / SPEED_STEP)) # -2
+STEPS_TO_HALF = 0  # 50% in the GUI speed scale maps to SPEED_START.
 
 # Power thresholds
 POWER_CRITICAL    = 15.0   # % - charge now regardless of mode
@@ -94,6 +100,18 @@ COOP_CHARGE_PEER  = 30.0   # % - cooperative robot yields if peer < this
 # Obstacle distance [m]
 OVERTAKE_DIST = 0.30        # activate yellow line to pass slow robot ahead
 YIELD_DIST    = 0.25        # slow down (cooperative yield)
+
+# Aggressive v1 tuning
+AGGRESSIVE_SAFE_DISTANCE = 0.45          # [m] begin slowing / overtaking
+AGGRESSIVE_EMERGENCY_DISTANCE = 0.18     # [m] lock brake if still closing
+AGGRESSIVE_TTC_SLOW = 2.0                # [s] time-to-collision slow threshold
+AGGRESSIVE_TTC_BRAKE = 0.8               # [s] time-to-collision brake threshold
+AGGRESSIVE_RANGE_STALE_SEC = 1.0
+AGGRESSIVE_CLOSING_ALPHA = 0.35
+AGGRESSIVE_BATTERY_PER_LAP_DEFAULT = 20.0
+AGGRESSIVE_BATTERY_RESERVE = 10.0
+AGGRESSIVE_LAP_EMA_ALPHA = 0.35
+AGGRESSIVE_MIN_VALID_LAP_DROP = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +133,9 @@ class DriverActions:
 
     def hold_yellow_line(self) -> Joy:
         return self.driver._charge_gate_control_msg()
+
+    def slow_for_charge_gate(self) -> Joy:
+        return self.driver._charge_gate_slow_msg()
 
     def wait_at_charge_gate(self) -> Joy:
         return self.driver._charge_gate_wait_msg()
@@ -160,7 +181,7 @@ class DrivingStrategyBase:
             if driver.in_fuel_zone:
                 driver.seeking_fuel = False
             else:
-                return actions.hold_yellow_line()
+                return actions.slow_for_charge_gate()
 
         if driver.in_fuel_zone and self.wants_charge(driver):
             driver.charge_state = ChargeState.LOCKING
@@ -185,7 +206,7 @@ class DrivingStrategyBase:
                 return actions.hold_yellow_line()
 
         if (self.wants_charge(driver)
-                and driver._active_charge_gate_cameras()
+                and driver._at_charge_gate()
                 and not driver.in_fuel_zone):
             if (self.waits_for_fuel_occupancy(driver)
                     and driver._active_charge_fuel_occupied_by_other()):
@@ -200,7 +221,7 @@ class DrivingStrategyBase:
             driver.waiting_for_fuel = False
             driver.gate_release_sent = False
             driver.seeking_fuel = True
-            return actions.hold_yellow_line()
+            return actions.slow_for_charge_gate()
 
         driver.waiting_for_fuel = False
         driver.gate_release_sent = False
@@ -217,13 +238,31 @@ class ConservativeStrategy(DrivingStrategyBase):
 
 class AggressiveStrategy(DrivingStrategyBase):
     def wants_charge(self, driver) -> bool:
-        return driver.power_level < POWER_CRITICAL
+        return (
+            driver.power_level < POWER_CRITICAL
+            or driver.power_level <= driver.aggressive_required_power()
+        )
 
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
         buttons = [0] * 12
-        driver._step_speed(STEPS_TO_MAX, buttons)
-        if driver.tof_range < OVERTAKE_DIST:
+        safety_state = driver._aggressive_front_safety_state()
+
+        if safety_state == "brake":
+            if not driver.local_brake:
+                return actions.press(BTN_X)
+            return actions.idle()
+
+        if driver.local_brake:
+            return actions.release_brake()
+
+        target_offset = STEPS_TO_MAX
+        if safety_state == "slow":
+            target_offset = 0
             buttons[BTN_B] = 1
+        elif safety_state == "overtake":
+            buttons[BTN_B] = 1
+
+        driver._step_speed(target_offset, buttons)
         return driver._make_joy(buttons=buttons)
 
 
@@ -288,6 +327,19 @@ class VirtualDriver:
         self.charge_camera_names = rospy.get_param(
             "~charge_camera_names", ["usb_cam_2"])
         self.control_rate = float(rospy.get_param("~control_rate", 2.0))
+        self.aggressive_safe_distance = float(rospy.get_param(
+            "~aggressive_safe_distance", AGGRESSIVE_SAFE_DISTANCE))
+        self.aggressive_emergency_distance = float(rospy.get_param(
+            "~aggressive_emergency_distance", AGGRESSIVE_EMERGENCY_DISTANCE))
+        self.aggressive_ttc_slow = float(rospy.get_param(
+            "~aggressive_ttc_slow", AGGRESSIVE_TTC_SLOW))
+        self.aggressive_ttc_brake = float(rospy.get_param(
+            "~aggressive_ttc_brake", AGGRESSIVE_TTC_BRAKE))
+        self.aggressive_battery_reserve = float(rospy.get_param(
+            "~aggressive_battery_reserve", AGGRESSIVE_BATTERY_RESERVE))
+        self.aggressive_battery_per_lap_estimate = float(rospy.get_param(
+            "~aggressive_battery_per_lap_default",
+            AGGRESSIVE_BATTERY_PER_LAP_DEFAULT))
 
         try:
             self.mode = DrivingMode(mode_str.strip().lower())
@@ -308,8 +360,17 @@ class VirtualDriver:
         self.local_brake       = True
         self.global_brake      = True    # True = game not running
         self.tof_range         = 9.9     # metres - default "clear"
+        self.current_speed     = SPEED_START
+        self.front_range_stamp = None
+        self.front_closing_speed = 0.0
+        self.front_ttc         = float("inf")
+        self.lap_count         = 0.0
+        self.last_lap_count    = None
+        self.lap_start_power   = self.power_level
+        self.battery_per_lap_learned = False
         self.other_power       = {r: 75.0 for r in self.other_robots}
         self.other_in_fuel     = {r: False for r in self.other_robots}
+        self.other_in_charge_gate = {r: False for r in self.other_robots}
         self.other_in_merge    = {r: False for r in self.other_robots}
         self.in_charge_gate_by_camera = {cam: False for cam in self.camera_names}
         self.other_in_fuel_by_camera = {
@@ -320,7 +381,7 @@ class VirtualDriver:
         # ---- Internal driver state -------------------------------------------
         # Have we already sent the one-shot brake-release Joy message?
         self.brake_released    = False
-        # Running estimate of the current speed step offset from SPEED_START.
+        # Current speed step offset, synchronised from /speed_percent when possible.
         # +N means N * L1 presses sent, -N means N * R1 presses sent.
         self.speed_offset      = 0
         self.charge_state      = ChargeState.IDLE
@@ -341,6 +402,8 @@ class VirtualDriver:
         # ---- Subscribers ------------------------------------------------------
         rospy.Subscriber(f"/{self.robot_name}/power_level",
                          Float32, self._cb_power)
+        rospy.Subscriber(f"/{self.robot_name}/speed_percent",
+                         Float32, self._cb_speed)
         rospy.Subscriber(f"/{self.robot_name}/local_brake",
                          Bool,    self._cb_local_brake)
         rospy.Subscriber(f"/{self.robot_name}/in_fuel_zone",
@@ -358,6 +421,8 @@ class VirtualDriver:
                          Bool,    self._cb_tag_visible)
         rospy.Subscriber(f"/{self.robot_name}/front_range",
                          Range,   self._cb_tof)
+        rospy.Subscriber(f"/{self.robot_name}/lap_count",
+                         Float32, self._cb_lap_count)
         rospy.Subscriber(f"/{self.robot_name}/set_driving_mode",
                          String,  self._cb_set_mode)
         rospy.Subscriber("/global_brake",
@@ -368,6 +433,8 @@ class VirtualDriver:
                              self._make_power_cb(robot))
             rospy.Subscriber(f"/{robot}/in_fuel_zone", Bool,
                              self._make_fuel_cb(robot))
+            rospy.Subscriber(f"/{robot}/in_charge_gate_zone", Bool,
+                             self._make_charge_gate_cb(robot))
             rospy.Subscriber(f"/{robot}/in_merge_zone", Bool,
                              self._make_merge_cb(robot))
             for cam in self.camera_names:
@@ -389,6 +456,11 @@ class VirtualDriver:
 
     def _cb_power(self, msg: Float32):
         self.power_level = msg.data
+
+    def _cb_speed(self, msg: Float32):
+        self.current_speed = msg.data
+        self.speed_offset = int(round(
+            (self.current_speed - SPEED_START) / SPEED_STEP))
 
     def _cb_local_brake(self, msg: Bool):
         self.local_brake = msg.data
@@ -412,7 +484,71 @@ class VirtualDriver:
         self.tag_visible = msg.data
 
     def _cb_tof(self, msg: Range):
-        self.tof_range = msg.range
+        now = rospy.Time.now().to_sec()
+        new_range = msg.range
+
+        if not math.isfinite(new_range) or new_range <= 0.0:
+            self.tof_range = 9.9
+            self.front_range_stamp = now
+            self.front_closing_speed = 0.0
+            self.front_ttc = float("inf")
+            return
+
+        if self.front_range_stamp is not None:
+            dt = now - self.front_range_stamp
+            if dt > 1.0e-3:
+                instant_closing = max(0.0, (self.tof_range - new_range) / dt)
+                alpha = AGGRESSIVE_CLOSING_ALPHA
+                self.front_closing_speed = (
+                    (1.0 - alpha) * self.front_closing_speed
+                    + alpha * instant_closing
+                )
+                if self.front_closing_speed > 1.0e-2:
+                    margin = max(0.0, new_range - self.aggressive_safe_distance)
+                    self.front_ttc = margin / self.front_closing_speed
+                else:
+                    self.front_ttc = float("inf")
+
+        self.tof_range = new_range
+        self.front_range_stamp = now
+
+    def _cb_lap_count(self, msg: Float32):
+        new_lap_count = msg.data
+
+        if self.last_lap_count is None:
+            self.lap_count = new_lap_count
+            self.last_lap_count = new_lap_count
+            self.lap_start_power = self.power_level
+            return
+
+        if new_lap_count > self.last_lap_count:
+            lap_delta = new_lap_count - self.last_lap_count
+            power_drop = self.lap_start_power - self.power_level
+            if lap_delta > 0.0 and power_drop >= AGGRESSIVE_MIN_VALID_LAP_DROP:
+                per_lap_drop = power_drop / lap_delta
+                if self.battery_per_lap_learned:
+                    alpha = AGGRESSIVE_LAP_EMA_ALPHA
+                    self.aggressive_battery_per_lap_estimate = (
+                        alpha * per_lap_drop
+                        + (1.0 - alpha) * self.aggressive_battery_per_lap_estimate
+                    )
+                else:
+                    self.aggressive_battery_per_lap_estimate = per_lap_drop
+                    self.battery_per_lap_learned = True
+
+                rospy.loginfo(
+                    "[VirtualDriver/%s] Aggressive learned %.1f%%/lap; "
+                    "charge threshold %.1f%%",
+                    self.robot_name,
+                    self.aggressive_battery_per_lap_estimate,
+                    self.aggressive_required_power())
+
+            self.lap_start_power = self.power_level
+        elif new_lap_count < self.last_lap_count:
+            self.lap_start_power = self.power_level
+
+        self.lap_count = new_lap_count
+        self.last_lap_count = new_lap_count
 
     def _cb_global_brake(self, msg: Bool):
         if msg.data and not self.global_brake:
@@ -467,6 +603,11 @@ class VirtualDriver:
             self.other_in_fuel[name] = msg.data
         return cb
 
+    def _make_charge_gate_cb(self, name: str):
+        def cb(msg: Bool):
+            self.other_in_charge_gate[name] = msg.data
+        return cb
+
     def _make_other_camera_fuel_cb(self, name: str, camera_name: str):
         def cb(msg: Bool):
             self.other_in_fuel_by_camera[name][camera_name] = msg.data
@@ -510,8 +651,10 @@ class VirtualDriver:
     def _step_speed(self, target_offset: int, buttons: list) -> list:
         """
         Add ONE L1 or R1 press toward target_offset if not already there.
-        Modifies and returns buttons in-place; updates self.speed_offset.
+        Modifies and returns buttons in-place; syncs from robot-reported speed.
         """
+        self.speed_offset = int(round(
+            (self.current_speed - SPEED_START) / SPEED_STEP))
         if self.speed_offset < target_offset:
             buttons[BTN_L1]   = 1
             self.speed_offset += 1
@@ -520,11 +663,22 @@ class VirtualDriver:
             self.speed_offset -= 1
         return buttons
 
+    def _step_speed_down_to(self, target_offset: int, buttons: list) -> list:
+        self.speed_offset = int(round(
+            (self.current_speed - SPEED_START) / SPEED_STEP))
+        if self.speed_offset > target_offset:
+            buttons[BTN_R1] = 1
+            self.speed_offset -= 1
+        return buttons
+
     def _active_charge_gate_cameras(self) -> list:
         return [
             cam for cam in self.charge_camera_names
             if self.in_charge_gate_by_camera.get(cam, False)
         ]
+
+    def _at_charge_gate(self) -> bool:
+        return self.in_charge_gate or bool(self._active_charge_gate_cameras())
 
     def _active_charge_fuel_occupied_by_other(self) -> bool:
         for cam in self._active_charge_gate_cameras():
@@ -536,8 +690,51 @@ class VirtualDriver:
     def _merge_zone_occupied_by_other(self) -> bool:
         return any(self.other_in_merge.values())
 
+    def aggressive_required_power(self) -> float:
+        return (
+            self.aggressive_battery_per_lap_estimate
+            + self.aggressive_battery_reserve
+        )
+
+    def _aggressive_front_safety_state(self) -> str:
+        if self.front_range_stamp is None:
+            return "clear"
+
+        age = rospy.Time.now().to_sec() - self.front_range_stamp
+        if age > AGGRESSIVE_RANGE_STALE_SEC:
+            return "clear"
+
+        if self.tof_range <= self.aggressive_emergency_distance:
+            return "brake"
+
+        if (
+            self.front_closing_speed > 1.0e-2
+            and self.front_ttc <= self.aggressive_ttc_brake
+        ):
+            return "brake"
+
+        if (
+            self.tof_range <= self.aggressive_safe_distance
+            or (
+                self.front_closing_speed > 1.0e-2
+                and self.front_ttc <= self.aggressive_ttc_slow
+            )
+        ):
+            return "slow"
+
+        if self.tof_range < OVERTAKE_DIST:
+            return "overtake"
+
+        return "clear"
+
     def _charge_gate_control_msg(self) -> Joy:
         return self._joy_press(BTN_B)
+
+    def _charge_gate_slow_msg(self) -> Joy:
+        buttons = [0] * 12
+        buttons[BTN_B] = 1
+        self._step_speed_down_to(STEPS_TO_HALF, buttons)
+        return self._make_joy(buttons=buttons)
 
     def _charge_gate_wait_msg(self) -> Joy:
         if not self.local_brake and not self.waiting_for_fuel:
