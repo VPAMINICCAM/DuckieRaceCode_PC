@@ -1,0 +1,50 @@
+<launch>
+  <arg name="robots"              default="[lucas, daisy]" />
+  <arg name="cruise_speed"        default="0.31" />
+  <arg name="charge_seek_speed"   default="0.22" />
+  <arg name="charge_target_power" default="92.0" />
+  <arg name="critical_power"      default="12.0" />
+  <arg name="charge_camera_name"  default="usb_cam_2" />
+  <arg name="hard_stop_range_m"   default="0.30" />
+  <arg name="safety_stop_distance_m" default="0.45" />
+  <arg name="safety_slow_distance_m" default="0.70" />
+
+  <!-- Q-learning parameters -->
+  <arg name="q_lr"      default="0.05" />
+  <arg name="q_gamma"   default="0.90" />
+  <arg name="q_epsilon" default="0.10" />
+
+  <node name="q_driver_lucas" pkg="vpa_duckierace" type="q_driver_node.py" output="screen" required="false">
+    <param name="robot_name"            value="lucas" />
+    <rosparam param="all_robots"        subst_value="True">$(arg robots)</rosparam>
+    <param name="cruise_speed"          value="$(arg cruise_speed)" />
+    <param name="charge_seek_speed"     value="$(arg charge_seek_speed)" />
+    <param name="charge_target_power"   value="$(arg charge_target_power)" />
+    <param name="critical_power"        value="$(arg critical_power)" />
+    <param name="charge_camera_name"    value="$(arg charge_camera_name)" />
+    <param name="hard_stop_range_m"     value="$(arg hard_stop_range_m)" />
+    <param name="safety_stop_distance_m" value="$(arg safety_stop_distance_m)" />
+    <param name="safety_slow_distance_m" value="$(arg safety_slow_distance_m)" />
+    <param name="q_lr"                  value="$(arg q_lr)" />
+    <param name="q_gamma"               value="$(arg q_gamma)" />
+    <param name="q_epsilon"             value="$(arg q_epsilon)" />
+    <param name="q_table_path"          value="$(env HOME)/.ros/duckierace_q_lucas.json" />
+  </node>
+
+  <node name="q_driver_daisy" pkg="vpa_duckierace" type="q_driver_node.py" output="screen" required="false">
+    <param name="robot_name"            value="daisy" />
+    <rosparam param="all_robots"        subst_value="True">$(arg robots)</rosparam>
+    <param name="cruise_speed"          value="$(arg cruise_speed)" />
+    <param name="charge_seek_speed"     value="$(arg charge_seek_speed)" />
+    <param name="charge_target_power"   value="$(arg charge_target_power)" />
+    <param name="critical_power"        value="$(arg critical_power)" />
+    <param name="charge_camera_name"    value="$(arg charge_camera_name)" />
+    <param name="hard_stop_range_m"     value="$(arg hard_stop_range_m)" />
+    <param name="safety_stop_distance_m" value="$(arg safety_stop_distance_m)" />
+    <param name="safety_slow_distance_m" value="$(arg safety_slow_distance_m)" />
+    <param name="q_lr"                  value="$(arg q_lr)" />
+    <param name="q_gamma"               value="$(arg q_gamma)" />
+    <param name="q_epsilon"             value="$(arg q_epsilon)" />
+    <param name="q_table_path"          value="$(env HOME)/.ros/duckierace_q_daisy.json" />
+  </node>
+</launch>

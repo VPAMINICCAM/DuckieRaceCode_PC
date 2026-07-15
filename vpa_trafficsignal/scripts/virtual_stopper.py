@@ -11,11 +11,10 @@ robot_dict = {
     # 2: 'vivian',
     # 3: 'gina',
     4: 'lucas',
-    # 5: 'daisy',
+    5: 'daisy',
     # 6: 'henry',
     # 7: 'dorie',
     # 8: 'luna',
-    10: 'fiona'
 }
 
 # what we do is that if a robot passes a virtual line in the image (vertically) already,

@@ -10,7 +10,7 @@
     <param name="robot_tag_config_path" value="$(arg tag_robot_map)" />
     <param name="fuel_hold_sec" value="0.5" />
     <rosparam param="camera_names">[usb_cam_1, usb_cam_2]</rosparam>
-    <rosparam param="fuel_camera_names">[usb_cam_2]</rosparam>
+    <rosparam param="fuel_camera_names">[usb_cam_1, usb_cam_2]</rosparam>
   </node>
 
   <!-- Camera Zone Manager Node -->

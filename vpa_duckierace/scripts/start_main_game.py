@@ -24,14 +24,14 @@ from pathlib import Path
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = PACKAGE_DIR.parents[1]
 TEST_DIR = PACKAGE_DIR / "test"
-DEFAULT_ROBOTS = (("fiona", "192.168.1.8"), ("lucas", "192.168.1.10"))
+DEFAULT_ROBOTS = (("daisy", "192.168.1.8"), ("lucas", "192.168.1.10"))
 KNOWN_ROBOT_NAMES_BY_IP = {
-    "192.168.1.8": "fiona",
+    "192.168.1.8": "daisy",
     "192.168.1.10": "lucas",
-    "192.168.1.13": "fiona",
+    "192.168.1.13": "daisy",
 }
 KNOWN_ROBOT_TAGS = {
-    "fiona": 10,
+    "daisy": 5,
     "lucas": 4,
     "henry": 6,
     "vivian": 2,
@@ -475,12 +475,12 @@ def sanitize_ros_name(value):
 
 def parse_robot_spec(spec):
     if "=" not in spec:
-        raise argparse.ArgumentTypeError("Robot must use name=ip format, for example fiona=192.168.1.8")
+        raise argparse.ArgumentTypeError("Robot must use name=ip format, for example daisy=192.168.1.8")
     name, ip = spec.split("=", 1)
     name = name.strip()
     ip = ip.strip()
     if not name or not ip:
-        raise argparse.ArgumentTypeError("Robot must use name=ip format, for example fiona=192.168.1.8")
+        raise argparse.ArgumentTypeError("Robot must use name=ip format, for example daisy=192.168.1.8")
     return {"name": name, "ip": ip}
 
 

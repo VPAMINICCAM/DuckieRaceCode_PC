@@ -41,9 +41,9 @@ Published topics:
 
 Parameters
 ----------
-~robot_name    str    default 'fiona'         Robot ROS namespace
+~robot_name    str    default 'daisy'         Robot ROS namespace
 ~driving_mode  str    default 'conservative'  Initial behavior mode
-~all_robots    list   default [fiona,lucas]
+~all_robots    list   default [lucas,daisy]
 ~control_rate  float  default 2.0             Control-loop frequency [Hz]
 """
 
@@ -354,14 +354,14 @@ class VirtualDriver:
     def __init__(self):
         rospy.init_node("virtual_driver_node")
 
-        self.robot_name  = rospy.get_param("~robot_name", "fiona")
+        self.robot_name  = rospy.get_param("~robot_name", "daisy")
         mode_str         = rospy.get_param("~driving_mode", "conservative")
         all_robots       = rospy.get_param(
-            "~all_robots", ["fiona", "lucas"])
+            "~all_robots", ["lucas", "daisy"])
         self.camera_names = rospy.get_param(
             "~camera_names", ["usb_cam_1", "usb_cam_2"])
         self.charge_camera_names = rospy.get_param(
-            "~charge_camera_names", ["usb_cam_2"])
+            "~charge_camera_names", ["usb_cam_1", "usb_cam_2"])
         self.control_rate = float(rospy.get_param("~control_rate", 2.0))
         self.aggressive_safe_distance = float(rospy.get_param(
             "~aggressive_safe_distance", AGGRESSIVE_SAFE_DISTANCE))

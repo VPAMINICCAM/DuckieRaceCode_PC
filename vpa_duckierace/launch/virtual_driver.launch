@@ -21,10 +21,10 @@
     Usage examples
     ==============
     # All robots in cooperative mode (Phase-2 demo):
-      roslaunch vpa_duckierace virtual_driver.launch fiona_mode:=cooperative lucas_mode:=cooperative
+      roslaunch vpa_duckierace virtual_driver.launch daisy_mode:=cooperative lucas_mode:=cooperative
 
     # All robots in aggressive mode (Phase-1 / selfish baseline):
-      roslaunch vpa_duckierace virtual_driver.launch fiona_mode:=aggressive lucas_mode:=aggressive
+      roslaunch vpa_duckierace virtual_driver.launch daisy_mode:=aggressive lucas_mode:=aggressive
 
     # Override one robot individually (run in separate terminal):
       rosrun vpa_duckierace virtual_driver_node.py
@@ -34,29 +34,17 @@
       rostopic pub /lucas/set_driving_mode std_msgs/String "data: 'cooperative'"
   -->
 
-  <arg name="fiona_mode" default="conservative"
-       doc="Initial behavior mode for fiona: manual|conservative|aggressive|cooperative|adaptive" />
   <arg name="lucas_mode" default="conservative"
        doc="Initial behavior mode for lucas: manual|conservative|aggressive|cooperative|adaptive" />
+  <arg name="daisy_mode" default="conservative"
+       doc="Initial behavior mode for daisy: manual|conservative|aggressive|cooperative|adaptive" />
   <arg name="control_rate" default="2.0"
        doc="Control loop frequency [Hz]. Keep at most 1/0.3 ~= 3.3 to match duckierace debounce." />
 
   <!-- Shared robot list (active DuckieRace robots) -->
-  <arg name="all_robots" default="[fiona, lucas]" />
+  <arg name="all_robots" default="[lucas, daisy]" />
   <arg name="camera_names" default="[usb_cam_1, usb_cam_2]" />
-  <arg name="charge_camera_names" default="[usb_cam_2]" />
-
-  <!-- fiona -->
-  <node name="virtual_driver_fiona"
-        pkg="vpa_duckierace" type="virtual_driver_node.py"
-        output="screen" required="false">
-    <param name="robot_name"   value="fiona" />
-    <param name="driving_mode" value="$(arg fiona_mode)" />
-    <param name="control_rate" value="$(arg control_rate)" />
-    <rosparam param="all_robots" subst_value="True">$(arg all_robots)</rosparam>
-    <rosparam param="camera_names" subst_value="True">$(arg camera_names)</rosparam>
-    <rosparam param="charge_camera_names" subst_value="True">$(arg charge_camera_names)</rosparam>
-  </node>
+  <arg name="charge_camera_names" default="[usb_cam_1, usb_cam_2]" />
 
   <!-- lucas -->
   <node name="virtual_driver_lucas"
@@ -69,4 +57,16 @@
     <rosparam param="camera_names" subst_value="True">$(arg camera_names)</rosparam>
     <rosparam param="charge_camera_names" subst_value="True">$(arg charge_camera_names)</rosparam>
   </node>
+  <!-- daisy -->
+  <node name="virtual_driver_daisy"
+        pkg="vpa_duckierace" type="virtual_driver_node.py"
+        output="screen" required="false">
+    <param name="robot_name"   value="daisy" />
+    <param name="driving_mode" value="$(arg daisy_mode)" />
+    <param name="control_rate" value="$(arg control_rate)" />
+    <rosparam param="all_robots" subst_value="True">$(arg all_robots)</rosparam>
+    <rosparam param="camera_names" subst_value="True">$(arg camera_names)</rosparam>
+    <rosparam param="charge_camera_names" subst_value="True">$(arg charge_camera_names)</rosparam>
+  </node>
+
 </launch>

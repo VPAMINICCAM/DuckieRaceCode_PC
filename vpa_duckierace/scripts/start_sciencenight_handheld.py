@@ -14,7 +14,7 @@ import paramiko
 
 
 ROBOTS = {
-    "fiona": "192.168.1.13",
+    "daisy": "192.168.1.13",
     "lucas": "192.168.1.10",
 }
 
