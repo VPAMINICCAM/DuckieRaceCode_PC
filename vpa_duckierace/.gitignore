@@ -8,3 +8,8 @@ __pycache__/
 .yaml
 config
 test
+# Keep the focused charging-policy regression test versioned while retaining
+# the local calibration images and editor artefacts under test/ as ignored.
+!test/
+test/*
+!test/test_virtual_driver_charging.py

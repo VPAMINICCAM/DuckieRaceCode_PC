@@ -17,6 +17,9 @@ class CamZoneManager:
         rospy.init_node('cam_zone_manager', anonymous=True)
         self.bridge = CvBridge()
         self.got_image = False
+        # Zone visualization is useful while calibrating, but it must never
+        # stop the image callback that publishes fuel/gate state during a race.
+        self.visualize_zones_on_start = rospy.get_param("~visualize_zones", False)
 
         # Load configs
         cam_config_path = rospy.get_param('~cam_config_path', None)
@@ -94,8 +97,8 @@ class CamZoneManager:
             self.got_image = True
             self.first_image = cv_image
             rospy.loginfo(f"Received first image on {self.image_topic}")
-            self.visualize_zones()
-            return
+            if self.visualize_zones_on_start:
+                self.visualize_zones()
 
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
         gray = self.apply_ignore_mask(gray)  # NEW
@@ -291,7 +294,8 @@ class CamZoneManager:
         plt.imshow(img_rgb)
         plt.title(f"Zones for {self.cam_name}")
         plt.axis('off')
-        plt.show()
+        plt.show(block=False)
+        plt.pause(0.001)
 
 if __name__ == '__main__':
     try:

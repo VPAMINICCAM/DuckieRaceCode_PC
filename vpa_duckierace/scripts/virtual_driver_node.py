@@ -38,6 +38,11 @@ Subscribed topics (all absolute paths):
 Published topics:
   /{robot_name}/joy                Joy      Synthetic joystick commands
   /{robot_name}/driving_mode       String   Active mode name (latched)
+  /{robot_name}/aggressive_lap_energy Float32 Learned / conservative lap budget
+  /{robot_name}/one_lap_required_power Float32 E + reserve for peer arbitration
+  /{robot_name}/charge_session_count UInt32 Completed charge slots (fair tie-break)
+  /{robot_name}/charge_request     Bool     Battery policy requests a charge
+  /{robot_name}/charger_claim      Bool     Car is approaching, waiting, or using charger
 
 Parameters
 ----------
@@ -45,12 +50,16 @@ Parameters
 ~driving_mode  str    default 'conservative'  Initial behavior mode
 ~all_robots    list   default [lucas,daisy]
 ~control_rate  float  default 2.0             Control-loop frequency [Hz]
+~aggressive_battery_per_lap_default float default 70.0 Conservative first-lap prior
+~aggressive_battery_reserve float default 10.0  Reserve retained after a lap
+~aggressive_calibration_min_power float default 80.0 First-lap charge floor
+~charge_gate_hold_sec float default 1.2         Gate-event latch duration
 """
 
 import rospy
 import math
 from sensor_msgs.msg import Joy, Range
-from std_msgs.msg import Bool, Float32, String
+from std_msgs.msg import Bool, Float32, String, UInt32
 from enum import Enum
 
 
@@ -108,18 +117,31 @@ AGGRESSIVE_TTC_SLOW = 2.0                # [s] time-to-collision slow threshold
 AGGRESSIVE_TTC_BRAKE = 0.8               # [s] time-to-collision brake threshold
 AGGRESSIVE_RANGE_STALE_SEC = 1.0
 AGGRESSIVE_CLOSING_ALPHA = 0.35
-AGGRESSIVE_BATTERY_PER_LAP_DEFAULT = 20.0
+# Start from the conservative result of the last race rather than gambling the
+# first learning lap on the old 20 % prior.  A completed uncharged lap replaces
+# this with the robot-specific estimate.
+AGGRESSIVE_BATTERY_PER_LAP_DEFAULT = 70.0
 AGGRESSIVE_BATTERY_RESERVE = 10.0
 AGGRESSIVE_LAP_EMA_ALPHA = 0.35
 AGGRESSIVE_MIN_VALID_LAP_DROP = 1.0
 AGGRESSIVE_CHARGE_START_MARGIN = 12.0
-AGGRESSIVE_DEFER_MARGIN = 6.0
 AGGRESSIVE_PRIORITY_EPSILON = 2.0
-AGGRESSIVE_PEER_LOW_POWER = 60.0
-AGGRESSIVE_NORMAL_CHARGE_TARGET = 90.0
-AGGRESSIVE_PRESSURE_CHARGE_TARGET = 55.0
-AGGRESSIVE_URGENT_CHARGE_TARGET = 65.0
+# A robot without a clean lap model only enters the charger below this floor.
+# It then charges fully so the next uncharged lap can calibrate its model.
+AGGRESSIVE_CALIBRATION_MIN_POWER = 80.0
+AGGRESSIVE_CALIBRATION_CHARGE_TARGET = POWER_CHARGE_FULL
+# Gate pulses are much shorter than the 2 Hz control loop in normal launches.
+AGGRESSIVE_CHARGE_GATE_HOLD_SEC = 1.2
+# Let simultaneous gate arrivals exchange their latched claims before either
+# car is admitted to the single charger.
+AGGRESSIVE_GATE_ARBITRATION_SEC = 0.35
+AGGRESSIVE_BRAKE_COMMAND_RETRY_SEC = 0.8
+AGGRESSIVE_CHARGER_STATUS_TIMEOUT_SEC = 2.0
+# A full charge is allowed only if the peer can safely continue racing.  The
+# additional "one complete lap" test is applied in aggressive_charge_target.
+AGGRESSIVE_FULL_CHARGE_PEER_SAFE_LAPS = 1
 AGGRESSIVE_CHARGE_TARGET_MARGIN = 5.0
+AGGRESSIVE_MIN_CHARGE_GAIN = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -188,28 +210,64 @@ class DrivingStrategyBase:
     def decide(self, driver, actions: DriverActions) -> Joy:
         if driver.charge_state != ChargeState.IDLE:
             return actions.charge(
-                self.charge_target_power(driver),
+                driver.active_charge_target,
                 self.waits_for_merge_occupancy(driver))
+
+        # A gate observation is intentionally short-lived, but a car that has
+        # stopped to yield must remain stopped until the charger is available.
+        # Otherwise it resumes normal driving as soon as the raw camera pulse
+        # falls false.
+        if driver.waiting_for_fuel:
+            if driver.in_fuel_zone:
+                driver.waiting_for_fuel = False
+                driver.seeking_fuel = False
+                driver._clear_charge_gate_arbitration()
+            elif driver._charge_gate_arbitrating():
+                return actions.wait_at_charge_gate()
+            elif (self.waits_for_fuel_occupancy(driver)
+                  and (driver._charger_occupied_by_other()
+                       or self.waits_for_charge_gate_priority(driver))):
+                return actions.wait_at_charge_gate()
+            else:
+                driver.waiting_for_fuel = False
+                driver.seeking_fuel = True
+                driver._clear_charge_gate_arbitration()
+                if driver.local_brake:
+                    return driver._release_gate_brake_if_due(actions)
+                return actions.slow_for_charge_gate()
 
         if driver.seeking_fuel:
             if driver.in_fuel_zone:
                 driver.seeking_fuel = False
+                driver._clear_charge_gate_arbitration()
             elif (self.waits_for_fuel_occupancy(driver)
-                    and driver._active_charge_fuel_occupied_by_other()):
+                    and driver._charger_occupied_by_other()):
                 driver.seeking_fuel = False
-                driver.gate_release_sent = False
+                driver.waiting_for_fuel = True
+                driver._reset_gate_release_retry()
                 return actions.wait_at_charge_gate()
             elif self.defers_charge_for_peer(driver):
                 driver.seeking_fuel = False
-                driver.gate_release_sent = False
+                driver._reset_gate_release_retry()
                 return self.normal_drive(driver, actions)
+            elif driver.local_brake:
+                return driver._release_gate_brake_if_due(actions)
             else:
                 return actions.slow_for_charge_gate()
 
+        # A completed charging slot must exit the fuel area before evaluating
+        # demand again; a one-lap target can intentionally remain below the
+        # early-start threshold while another car is waiting.
+        if driver.leaving_charge:
+            if driver.in_merge_zone:
+                driver.leaving_charge = False
+            else:
+                return actions.hold_yellow_line()
+
         if driver.in_fuel_zone and self.wants_charge(driver):
-            driver.charge_state = ChargeState.LOCKING
+            driver._begin_charge(self.charge_target_power(driver))
             return actions.charge(
-                self.charge_target_power(driver),
+                driver.active_charge_target,
                 self.waits_for_merge_occupancy(driver))
 
         if driver.in_fuel_zone:
@@ -222,33 +280,33 @@ class DrivingStrategyBase:
                 if joy_msg is not None:
                     return joy_msg
 
-        if driver.leaving_charge:
-            if driver.in_merge_zone:
-                driver.leaving_charge = False
-            else:
-                return actions.hold_yellow_line()
-
         if (self.wants_charge(driver)
                 and driver._at_charge_gate()
                 and not driver.in_fuel_zone):
-            if (self.waits_for_fuel_occupancy(driver)
-                    and (driver._active_charge_fuel_occupied_by_other()
-                         or self.waits_for_charge_gate_priority(driver))):
-                driver.gate_release_sent = False
+            if not driver._charge_gate_arbitrating():
+                driver._start_charge_gate_arbitration()
+                driver.waiting_for_fuel = True
+                driver._reset_gate_release_retry()
                 return actions.wait_at_charge_gate()
-            if driver.local_brake:
-                driver.waiting_for_fuel = False
-                if not driver.gate_release_sent:
-                    driver.gate_release_sent = True
-                    return actions.release_brake()
-                return actions.idle()
-            driver.waiting_for_fuel = False
-            driver.gate_release_sent = False
+            if (self.waits_for_fuel_occupancy(driver)
+                    and (driver._charger_occupied_by_other()
+                         or self.waits_for_charge_gate_priority(driver))):
+                driver.waiting_for_fuel = True
+                driver._reset_gate_release_retry()
+                return actions.wait_at_charge_gate()
+            # Persist the admission before toggling the brake.  This keeps the
+            # car on the yellow line even if the gate pulse expires meanwhile.
             driver.seeking_fuel = True
+            driver.waiting_for_fuel = False
+            driver._clear_charge_gate_arbitration()
+            if driver.local_brake:
+                return driver._release_gate_brake_if_due(actions)
+            driver._reset_gate_release_retry()
             return actions.slow_for_charge_gate()
 
         driver.waiting_for_fuel = False
-        driver.gate_release_sent = False
+        driver._clear_charge_gate_arbitration()
+        driver._reset_gate_release_retry()
         return self.normal_drive(driver, actions)
 
 
@@ -262,13 +320,15 @@ class ConservativeStrategy(DrivingStrategyBase):
 
 class AggressiveStrategy(DrivingStrategyBase):
     def wants_charge(self, driver) -> bool:
+        if not driver.aggressive_charge_demand():
+            return False
         if driver.power_level < POWER_CRITICAL:
+            return True
+        if not driver.battery_per_lap_learned:
             return True
         if driver.power_level <= driver.aggressive_hard_charge_threshold():
             return True
-        if driver.power_level <= driver.aggressive_charge_start_threshold():
-            return not driver._aggressive_should_defer_charge()
-        return False
+        return not driver._aggressive_should_defer_charge()
 
     def charge_target_power(self, driver) -> float:
         return driver.aggressive_charge_target_power()
@@ -379,25 +439,33 @@ class VirtualDriver:
         self.aggressive_charge_start_margin = float(rospy.get_param(
             "~aggressive_charge_start_margin",
             AGGRESSIVE_CHARGE_START_MARGIN))
-        self.aggressive_defer_margin = float(rospy.get_param(
-            "~aggressive_defer_margin", AGGRESSIVE_DEFER_MARGIN))
         self.aggressive_priority_epsilon = float(rospy.get_param(
             "~aggressive_priority_epsilon",
             AGGRESSIVE_PRIORITY_EPSILON))
-        self.aggressive_peer_low_power = float(rospy.get_param(
-            "~aggressive_peer_low_power", AGGRESSIVE_PEER_LOW_POWER))
-        self.aggressive_normal_charge_target = float(rospy.get_param(
-            "~aggressive_normal_charge_target",
-            AGGRESSIVE_NORMAL_CHARGE_TARGET))
-        self.aggressive_pressure_charge_target = float(rospy.get_param(
-            "~aggressive_pressure_charge_target",
-            AGGRESSIVE_PRESSURE_CHARGE_TARGET))
-        self.aggressive_urgent_charge_target = float(rospy.get_param(
-            "~aggressive_urgent_charge_target",
-            AGGRESSIVE_URGENT_CHARGE_TARGET))
+        self.aggressive_calibration_min_power = float(rospy.get_param(
+            "~aggressive_calibration_min_power",
+            AGGRESSIVE_CALIBRATION_MIN_POWER))
+        self.aggressive_calibration_charge_target = float(rospy.get_param(
+            "~aggressive_calibration_charge_target",
+            AGGRESSIVE_CALIBRATION_CHARGE_TARGET))
+        self.charge_gate_hold_sec = float(rospy.get_param(
+            "~charge_gate_hold_sec", AGGRESSIVE_CHARGE_GATE_HOLD_SEC))
+        self.charge_gate_arbitration_sec = float(rospy.get_param(
+            "~charge_gate_arbitration_sec", AGGRESSIVE_GATE_ARBITRATION_SEC))
+        self.brake_command_retry_sec = float(rospy.get_param(
+            "~brake_command_retry_sec", AGGRESSIVE_BRAKE_COMMAND_RETRY_SEC))
+        self.charger_status_timeout_sec = float(rospy.get_param(
+            "~charger_status_timeout_sec", AGGRESSIVE_CHARGER_STATUS_TIMEOUT_SEC))
+        self.aggressive_full_charge_peer_safe_laps = max(1, int(rospy.get_param(
+            "~aggressive_full_charge_peer_safe_laps",
+            AGGRESSIVE_FULL_CHARGE_PEER_SAFE_LAPS)))
         self.aggressive_charge_target_margin = float(rospy.get_param(
             "~aggressive_charge_target_margin",
             AGGRESSIVE_CHARGE_TARGET_MARGIN))
+        self.aggressive_min_charge_gain = float(rospy.get_param(
+            "~aggressive_min_charge_gain", AGGRESSIVE_MIN_CHARGE_GAIN))
+        self.aggressive_default_lap_energy = (
+            self.aggressive_battery_per_lap_estimate)
 
         try:
             self.mode = DrivingMode(mode_str.strip().lower())
@@ -426,7 +494,25 @@ class VirtualDriver:
         self.last_lap_count    = None
         self.lap_start_power   = self.power_level
         self.battery_per_lap_learned = False
-        self.other_power       = {r: 75.0 for r in self.other_robots}
+        self.charged_since_lap_start = False
+        self.charge_gate_until = 0.0
+        self.charge_gate_arbitration_until = 0.0
+        # Treat an unseen peer as safe until its latched state arrives.  This
+        # avoids an offline/late subscriber permanently forcing short charges.
+        self.other_power       = {r: 100.0 for r in self.other_robots}
+        self.other_lap_energy = {
+            r: self.aggressive_default_lap_energy for r in self.other_robots
+        }
+        self.other_one_lap_required_power = {
+            r: min(100.0, self.aggressive_default_lap_energy
+                   + self.aggressive_battery_reserve)
+            for r in self.other_robots
+        }
+        self.other_charge_sessions = {r: 0 for r in self.other_robots}
+        self.other_charge_requested = {r: False for r in self.other_robots}
+        self.other_charger_claimed = {r: False for r in self.other_robots}
+        self.other_charge_request_stamp = {r: None for r in self.other_robots}
+        self.other_charger_claim_stamp = {r: None for r in self.other_robots}
         self.other_in_fuel     = {r: False for r in self.other_robots}
         self.other_in_charge_gate = {r: False for r in self.other_robots}
         self.other_in_merge    = {r: False for r in self.other_robots}
@@ -443,8 +529,14 @@ class VirtualDriver:
         # +N means N * L1 presses sent, -N means N * R1 presses sent.
         self.speed_offset      = 0
         self.charge_state      = ChargeState.IDLE
+        self.active_charge_target = POWER_CHARGE_FULL
+        self.active_charge_target_reason = ""
+        self.charge_session_count = 0
+        self.charge_lock_last_sent = None
         self.waiting_for_fuel  = False
         self.gate_release_sent = False
+        self.gate_release_last_sent = None
+        self.fuel_wait_brake_last_sent = None
         self.waiting_for_merge = False
         self.merge_release_sent = False
         self.seeking_fuel      = False
@@ -456,6 +548,21 @@ class VirtualDriver:
             f"/{self.robot_name}/joy", Joy, queue_size=1)
         self.mode_pub = rospy.Publisher(
             f"/{self.robot_name}/driving_mode", String, queue_size=1, latch=True)
+        # These latched topics let each driver compare the peer's *own* learned
+        # energy model rather than applying its local model to both vehicles.
+        self.lap_energy_pub = rospy.Publisher(
+            f"/{self.robot_name}/aggressive_lap_energy", Float32,
+            queue_size=1, latch=True)
+        self.one_lap_required_power_pub = rospy.Publisher(
+            f"/{self.robot_name}/one_lap_required_power", Float32,
+            queue_size=1, latch=True)
+        self.charge_sessions_pub = rospy.Publisher(
+            f"/{self.robot_name}/charge_session_count", UInt32,
+            queue_size=1, latch=True)
+        self.charge_request_pub = rospy.Publisher(
+            f"/{self.robot_name}/charge_request", Bool, queue_size=1, latch=True)
+        self.charger_claim_pub = rospy.Publisher(
+            f"/{self.robot_name}/charger_claim", Bool, queue_size=1, latch=True)
 
         # ---- Subscribers ------------------------------------------------------
         rospy.Subscriber(f"/{self.robot_name}/power_level",
@@ -485,6 +592,7 @@ class VirtualDriver:
                          String,  self._cb_set_mode)
         rospy.Subscriber("/global_brake",
                          Bool,    self._cb_global_brake)
+        rospy.Subscriber("/reset_laps", Bool, self._cb_reset_laps)
 
         for robot in self.other_robots:
             rospy.Subscriber(f"/{robot}/power_level", Float32,
@@ -495,6 +603,16 @@ class VirtualDriver:
                              self._make_charge_gate_cb(robot))
             rospy.Subscriber(f"/{robot}/in_merge_zone", Bool,
                              self._make_merge_cb(robot))
+            rospy.Subscriber(f"/{robot}/aggressive_lap_energy", Float32,
+                             self._make_lap_energy_cb(robot))
+            rospy.Subscriber(f"/{robot}/one_lap_required_power", Float32,
+                             self._make_required_power_cb(robot))
+            rospy.Subscriber(f"/{robot}/charge_session_count", UInt32,
+                             self._make_charge_sessions_cb(robot))
+            rospy.Subscriber(f"/{robot}/charge_request", Bool,
+                             self._make_charge_request_cb(robot))
+            rospy.Subscriber(f"/{robot}/charger_claim", Bool,
+                             self._make_charger_claim_cb(robot))
             for cam in self.camera_names:
                 rospy.Subscriber(
                     f"/{robot}/{cam}/in_fuel_zone", Bool,
@@ -507,6 +625,8 @@ class VirtualDriver:
             f"[VirtualDriver/{self.robot_name}] "
             f"Started in '{self.mode.value}' mode at {self.control_rate} Hz")
         self.mode_pub.publish(String(data=self.mode.value))
+        self._publish_aggressive_budget()
+        self._publish_charge_status()
 
     # ==========================================================================
     # Callbacks
@@ -528,6 +648,8 @@ class VirtualDriver:
 
     def _cb_charge_gate(self, msg: Bool):
         self.in_charge_gate = msg.data
+        if msg.data:
+            self._latch_charge_gate()
 
     def _cb_merge(self, msg: Bool):
         self.in_merge_zone = msg.data
@@ -536,6 +658,8 @@ class VirtualDriver:
         def cb(msg: Bool):
             if field == "charge_gate":
                 self.in_charge_gate_by_camera[camera_name] = msg.data
+                if msg.data:
+                    self._latch_charge_gate()
         return cb
 
     def _cb_tag_visible(self, msg: Bool):
@@ -582,7 +706,11 @@ class VirtualDriver:
         if new_lap_count > self.last_lap_count:
             lap_delta = new_lap_count - self.last_lap_count
             power_drop = self.lap_start_power - self.power_level
-            if lap_delta > 0.0 and power_drop >= AGGRESSIVE_MIN_VALID_LAP_DROP:
+            if self.charged_since_lap_start:
+                rospy.loginfo(
+                    "[VirtualDriver/%s] Ignoring lap energy sample containing a charge",
+                    self.robot_name)
+            elif lap_delta > 0.0 and power_drop >= AGGRESSIVE_MIN_VALID_LAP_DROP:
                 per_lap_drop = power_drop / lap_delta
                 if self.battery_per_lap_learned:
                     alpha = AGGRESSIVE_LAP_EMA_ALPHA
@@ -600,10 +728,13 @@ class VirtualDriver:
                     self.robot_name,
                     self.aggressive_battery_per_lap_estimate,
                     self.aggressive_required_power())
+                self._publish_aggressive_budget()
 
             self.lap_start_power = self.power_level
+            self.charged_since_lap_start = False
         elif new_lap_count < self.last_lap_count:
             self.lap_start_power = self.power_level
+            self.charged_since_lap_start = False
 
         self.lap_count = new_lap_count
         self.last_lap_count = new_lap_count
@@ -618,13 +749,28 @@ class VirtualDriver:
             self.brake_released = False
             self.speed_offset   = 0
             self.charge_state   = ChargeState.IDLE
+            self.active_charge_target = POWER_CHARGE_FULL
+            self.active_charge_target_reason = ""
+            self.charge_lock_last_sent = None
             self.waiting_for_fuel = False
-            self.gate_release_sent = False
+            self._reset_gate_release_retry()
             self.waiting_for_merge = False
             self.merge_release_sent = False
             self.seeking_fuel = False
             self.leaving_charge = False
+            self.charge_gate_until = 0.0
+            self.charge_gate_arbitration_until = 0.0
+        elif not msg.data and self.global_brake:
+            # The GUI resets power independently of /reset_laps.  Race start
+            # is therefore the reliable point to establish a fresh baseline.
+            self._reset_aggressive_learning()
         self.global_brake = msg.data
+        self._publish_charge_status()
+
+    def _cb_reset_laps(self, msg: Bool):
+        if not msg.data:
+            return
+        self._reset_aggressive_learning()
 
     def _cb_set_mode(self, msg: String):
         try:
@@ -641,8 +787,11 @@ class VirtualDriver:
             self.brake_released = False   # re-release brake on mode change
             self.speed_offset   = 0
             self.charge_state   = ChargeState.IDLE
+            self.active_charge_target = POWER_CHARGE_FULL
+            self.active_charge_target_reason = ""
+            self.charge_lock_last_sent = None
             self.waiting_for_fuel = False
-            self.gate_release_sent = False
+            self._reset_gate_release_retry()
             self.waiting_for_merge = False
             self.merge_release_sent = False
             self.seeking_fuel = False
@@ -650,10 +799,40 @@ class VirtualDriver:
             rospy.loginfo(
                 f"[VirtualDriver/{self.robot_name}] Mode -> {self.mode.value}")
             self.mode_pub.publish(String(data=self.mode.value))
+            self._publish_charge_status()
 
     def _make_power_cb(self, name: str):
         def cb(msg: Float32):
             self.other_power[name] = msg.data
+        return cb
+
+    def _make_lap_energy_cb(self, name: str):
+        def cb(msg: Float32):
+            if msg.data > 0.0:
+                self.other_lap_energy[name] = msg.data
+        return cb
+
+    def _make_required_power_cb(self, name: str):
+        def cb(msg: Float32):
+            if msg.data > 0.0:
+                self.other_one_lap_required_power[name] = min(100.0, msg.data)
+        return cb
+
+    def _make_charge_sessions_cb(self, name: str):
+        def cb(msg: UInt32):
+            self.other_charge_sessions[name] = int(msg.data)
+        return cb
+
+    def _make_charge_request_cb(self, name: str):
+        def cb(msg: Bool):
+            self.other_charge_requested[name] = bool(msg.data)
+            self.other_charge_request_stamp[name] = rospy.Time.now().to_sec()
+        return cb
+
+    def _make_charger_claim_cb(self, name: str):
+        def cb(msg: Bool):
+            self.other_charger_claimed[name] = bool(msg.data)
+            self.other_charger_claim_stamp[name] = rospy.Time.now().to_sec()
         return cb
 
     def _make_fuel_cb(self, name: str):
@@ -735,8 +914,30 @@ class VirtualDriver:
             if self.in_charge_gate_by_camera.get(cam, False)
         ]
 
+    def _latch_charge_gate(self):
+        self.charge_gate_until = max(
+            self.charge_gate_until,
+            rospy.Time.now().to_sec() + self.charge_gate_hold_sec,
+        )
+
+    def _start_charge_gate_arbitration(self):
+        self.charge_gate_arbitration_until = max(
+            self.charge_gate_arbitration_until,
+            rospy.Time.now().to_sec() + self.charge_gate_arbitration_sec,
+        )
+
+    def _charge_gate_arbitrating(self) -> bool:
+        return self.charge_gate_arbitration_until > rospy.Time.now().to_sec()
+
+    def _clear_charge_gate_arbitration(self):
+        self.charge_gate_arbitration_until = 0.0
+
     def _at_charge_gate(self) -> bool:
-        return self.in_charge_gate or bool(self._active_charge_gate_cameras())
+        return (
+            self.in_charge_gate
+            or bool(self._active_charge_gate_cameras())
+            or self.charge_gate_until > rospy.Time.now().to_sec()
+        )
 
     def _active_charge_fuel_occupied_by_other(self) -> bool:
         for cam in self._active_charge_gate_cameras():
@@ -745,13 +946,182 @@ class VirtualDriver:
                     return True
         return False
 
+    def _charger_occupied_by_other(self) -> bool:
+        """Return true while another robot owns the single physical charger."""
+        return (
+            self._active_charge_fuel_occupied_by_other()
+            or any(self.other_in_fuel.values())
+        )
+
+    def _reset_gate_release_retry(self):
+        self.gate_release_sent = False
+        self.gate_release_last_sent = None
+        self.fuel_wait_brake_last_sent = None
+
+    def _release_gate_brake_if_due(self, actions: DriverActions) -> Joy:
+        """Retry an admission brake release until local_brake confirms it."""
+        now = rospy.Time.now().to_sec()
+        if (
+                self.gate_release_last_sent is None
+                or now - self.gate_release_last_sent >= self.brake_command_retry_sec):
+            self.gate_release_last_sent = now
+            self.gate_release_sent = True
+            return actions.release_brake()
+        return actions.idle()
+
     def _merge_zone_occupied_by_other(self) -> bool:
         return any(self.other_in_merge.values())
 
+    def _begin_charge(self, target_power: float):
+        self.charge_state = ChargeState.LOCKING
+        self.active_charge_target = min(
+            POWER_CHARGE_FULL, max(0.0, float(target_power)))
+        self.active_charge_target_reason = (
+            "aggressive" if self.mode == DrivingMode.AGGRESSIVE else self.mode.value)
+        self.charge_lock_last_sent = None
+        # A lap that spans any charge is not a clean energy-consumption sample.
+        self.charged_since_lap_start = True
+        rospy.loginfo(
+            "[VirtualDriver/%s] Charging plan: %.1f%% target",
+            self.robot_name,
+            self.active_charge_target,
+        )
+
+    def _publish_aggressive_budget(self):
+        self.lap_energy_pub.publish(Float32(
+            data=self.aggressive_battery_per_lap_estimate))
+        self.one_lap_required_power_pub.publish(Float32(
+            data=self.aggressive_required_power()))
+        self.charge_sessions_pub.publish(UInt32(data=self.charge_session_count))
+
+    def _publish_charge_status(self):
+        aggressive = (
+            self.mode == DrivingMode.AGGRESSIVE and not self.global_brake)
+        requested = aggressive and self.aggressive_charge_demand()
+        claimed = aggressive and (
+            self.seeking_fuel
+            or self.waiting_for_fuel
+            or self.in_fuel_zone
+            or self.charge_state != ChargeState.IDLE
+            or (requested and self._at_charge_gate())
+        )
+        self.charge_request_pub.publish(Bool(data=requested))
+        self.charger_claim_pub.publish(Bool(data=claimed))
+
+    def _reset_aggressive_learning(self):
+        self.aggressive_battery_per_lap_estimate = (
+            self.aggressive_default_lap_energy)
+        self.battery_per_lap_learned = False
+        self.lap_count = 0.0
+        self.last_lap_count = None
+        self.lap_start_power = self.power_level
+        self.charged_since_lap_start = False
+        self.charge_session_count = 0
+        self.charge_gate_until = 0.0
+        self.charge_gate_arbitration_until = 0.0
+        self._publish_aggressive_budget()
+        self._publish_charge_status()
+        rospy.loginfo(
+            "[VirtualDriver/%s] Reset aggressive lap-energy calibration",
+            self.robot_name)
+
     def aggressive_required_power(self) -> float:
-        return (
+        return min(100.0, (
             self.aggressive_battery_per_lap_estimate
             + self.aggressive_battery_reserve
+        ))
+
+    def aggressive_one_lap_target_power(self) -> float:
+        return min(
+            POWER_CHARGE_FULL,
+            self.aggressive_required_power() + self.aggressive_charge_target_margin,
+        )
+
+    def aggressive_safe_laps(self) -> int:
+        return self._safe_laps(
+            self.power_level,
+            self.aggressive_required_power(),
+            self.aggressive_battery_per_lap_estimate,
+        )
+
+    @staticmethod
+    def _safe_laps(power_level: float, required_power: float,
+                   lap_energy: float) -> int:
+        """Completed laps available while retaining the configured reserve."""
+        if lap_energy <= 0.0 or power_level < required_power:
+            return 0
+        return 1 + int((power_level - required_power) // lap_energy)
+
+    def _aggressive_peer_required_power(self, robot: str) -> float:
+        return self.other_one_lap_required_power.get(robot, 100.0)
+
+    def _aggressive_peer_safe_laps(self, robot: str) -> int:
+        return self._safe_laps(
+            self.other_power.get(robot, 100.0),
+            self._aggressive_peer_required_power(robot),
+            self.other_lap_energy.get(robot, self.aggressive_default_lap_energy),
+        )
+
+    def _charger_status_is_fresh(self, stamp) -> bool:
+        return (
+            stamp is None
+            or rospy.Time.now().to_sec() - stamp <= self.charger_status_timeout_sec
+        )
+
+    def _aggressive_peer_is_contending(self, robot: str) -> bool:
+        return (
+            (
+                self.other_charger_claimed.get(robot, False)
+                and self._charger_status_is_fresh(
+                    self.other_charger_claim_stamp.get(robot))
+            )
+            or self.other_in_fuel.get(robot, False)
+            or self.other_in_charge_gate.get(robot, False)
+        )
+
+    def _aggressive_peer_has_charge_demand(self, robot: str) -> bool:
+        if (
+                self.other_charge_requested.get(robot, False)
+                and self._charger_status_is_fresh(
+                    self.other_charge_request_stamp.get(robot))):
+            return True
+        return (
+            self._aggressive_peer_is_contending(robot)
+            and self.other_power.get(robot, 100.0)
+            <= self._aggressive_peer_required_power(robot)
+            + self.aggressive_charge_start_margin
+        )
+
+    def _aggressive_peer_needs_charger(self) -> bool:
+        return any(
+            self._aggressive_peer_has_charge_demand(robot)
+            for robot in self.other_robots
+        )
+
+    def _aggressive_peer_requires_handoff(self) -> bool:
+        return any(
+            self._aggressive_peer_has_charge_demand(robot)
+            and self._aggressive_peer_safe_laps(robot)
+            < self.aggressive_full_charge_peer_safe_laps
+            for robot in self.other_robots
+        )
+
+    def aggressive_charge_demand(self) -> bool:
+        """Demand before arbitration; unlike wants_charge it never yields."""
+        if not self.battery_per_lap_learned:
+            below_entry_threshold = (
+                self.power_level <= self.aggressive_calibration_min_power)
+        else:
+            below_entry_threshold = (
+                self.power_level <= self.aggressive_charge_start_threshold())
+        if not below_entry_threshold:
+            return False
+
+        # Do not take a charger slot merely because we are inside the early
+        # start band when the selected one-lap target is already below us.
+        return (
+            self.aggressive_charge_target_power()
+            > self.power_level + self.aggressive_min_charge_gain
         )
 
     def aggressive_hard_charge_threshold(self) -> float:
@@ -764,55 +1134,57 @@ class VirtualDriver:
         )
 
     def aggressive_can_defer_charge(self) -> bool:
-        return (
-            self.power_level
-            > self.aggressive_hard_charge_threshold()
-            + self.aggressive_defer_margin
-        )
+        return self.aggressive_safe_laps() >= 1
 
     def aggressive_charge_target_power(self) -> float:
-        hard_target = (
-            self.aggressive_hard_charge_threshold()
-            + self.aggressive_charge_target_margin
+        if not self.battery_per_lap_learned:
+            if (
+                    self._aggressive_charger_is_contended()
+                    or self._aggressive_peer_needs_charger()):
+                return self.aggressive_one_lap_target_power()
+            return min(POWER_CHARGE_FULL,
+                       self.aggressive_calibration_charge_target)
+
+        one_lap_target = self.aggressive_one_lap_target_power()
+        if self._aggressive_charger_is_contended():
+            return one_lap_target
+
+        # A full charge must buy at least one additional complete lap.  It is
+        # otherwise pure waiting time and creates an avoidable charger stop.
+        full_charge_buys_lap = (
+            POWER_CHARGE_FULL
+            >= one_lap_target + self.aggressive_battery_per_lap_estimate
         )
+        peers_can_continue = all(
+            self._aggressive_peer_safe_laps(robot)
+            >= self.aggressive_full_charge_peer_safe_laps
+            for robot in self.other_robots
+        )
+        if full_charge_buys_lap and peers_can_continue:
+            return POWER_CHARGE_FULL
+        return one_lap_target
 
-        if self._aggressive_peer_charge_pressure():
-            if self.power_level <= self.aggressive_hard_charge_threshold():
-                return min(
-                    self.aggressive_normal_charge_target,
-                    max(self.aggressive_urgent_charge_target, hard_target))
-            return min(
-                self.aggressive_normal_charge_target,
-                max(self.aggressive_pressure_charge_target, hard_target))
-
-        return self.aggressive_normal_charge_target
-
-    def _aggressive_peer_charge_pressure(self) -> bool:
-        for robot in self.other_robots:
-            if self.other_in_fuel.get(robot, False):
-                return True
-            if self.other_in_charge_gate.get(robot, False):
-                return True
-            if self.other_power.get(robot, 100.0) <= self.aggressive_peer_low_power:
-                return True
-        return False
-
-    def _aggressive_peer_urgency(self, power_level: float) -> float:
-        return self.aggressive_hard_charge_threshold() - power_level
+    def _aggressive_charger_is_contended(self) -> bool:
+        return any(
+            self._aggressive_peer_is_contending(robot)
+            and self._aggressive_peer_has_charge_demand(robot)
+            for robot in self.other_robots
+        )
 
     def _aggressive_peer_has_priority(self, robot: str) -> bool:
         peer_power = self.other_power.get(robot, 100.0)
-        peer_urgency = self._aggressive_peer_urgency(peer_power)
-        self_urgency = self._aggressive_peer_urgency(self.power_level)
+        peer_margin = peer_power - self._aggressive_peer_required_power(robot)
+        self_margin = self.power_level - self.aggressive_required_power()
         epsilon = self.aggressive_priority_epsilon
 
-        if peer_urgency > self_urgency + epsilon:
+        if peer_margin < self_margin - epsilon:
             return True
-        if self_urgency > peer_urgency + epsilon:
+        if self_margin < peer_margin - epsilon:
             return False
-        if peer_power < self.power_level - epsilon:
+        peer_sessions = self.other_charge_sessions.get(robot, 0)
+        if peer_sessions < self.charge_session_count:
             return True
-        if self.power_level < peer_power - epsilon:
+        if self.charge_session_count < peer_sessions:
             return False
         return robot < self.robot_name
 
@@ -821,15 +1193,10 @@ class VirtualDriver:
             return False
 
         for robot in self.other_robots:
-            peer_low = (
-                self.other_power.get(robot, 100.0)
-                <= self.aggressive_charge_start_threshold()
-            )
-            peer_present = (
-                self.other_in_fuel.get(robot, False)
-                or self.other_in_charge_gate.get(robot, False)
-            )
-            if (peer_low or peer_present) and self._aggressive_peer_has_priority(robot):
+            if (
+                    self._aggressive_peer_is_contending(robot)
+                    and self._aggressive_peer_has_charge_demand(robot)
+                    and self._aggressive_peer_has_priority(robot)):
                 return True
 
         return False
@@ -837,7 +1204,8 @@ class VirtualDriver:
     def _aggressive_peer_has_gate_priority(self) -> bool:
         for robot in self.other_robots:
             if (
-                    self.other_in_charge_gate.get(robot, False)
+                    self._aggressive_peer_is_contending(robot)
+                    and self._aggressive_peer_has_charge_demand(robot)
                     and self._aggressive_peer_has_priority(robot)):
                 return True
         return False
@@ -883,10 +1251,17 @@ class VirtualDriver:
         return self._make_joy(buttons=buttons)
 
     def _charge_gate_wait_msg(self) -> Joy:
-        if not self.local_brake and not self.waiting_for_fuel:
-            self.waiting_for_fuel = True
-            return self._joy_press(BTN_X)
+        if not self.local_brake:
+            now = rospy.Time.now().to_sec()
+            if (
+                    self.fuel_wait_brake_last_sent is None
+                    or now - self.fuel_wait_brake_last_sent >= self.brake_command_retry_sec):
+                self.fuel_wait_brake_last_sent = now
+                self.waiting_for_fuel = True
+                return self._joy_press(BTN_X)
         self.waiting_for_fuel = True
+        if self.local_brake:
+            self.fuel_wait_brake_last_sent = None
         return self._make_joy()
 
     def _merge_wait_msg(self) -> Joy:
@@ -911,18 +1286,60 @@ class VirtualDriver:
             target_power: float = POWER_CHARGE_FULL,
             wait_for_merge: bool = True) -> Joy:
         if self.charge_state == ChargeState.LOCKING:
-            self.charge_state = ChargeState.CHARGING
-            rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Brake locked for charging")
-            return self._joy_press(BTN_X)
+            if self.local_brake:
+                self.charge_state = ChargeState.CHARGING
+                self.charge_lock_last_sent = None
+                rospy.loginfo(
+                    f"[VirtualDriver/{self.robot_name}] Brake locked for charging")
+                return self._joy_press(BTN_Y)
+
+            now = rospy.Time.now().to_sec()
+            if (
+                    self.charge_lock_last_sent is None
+                    or now - self.charge_lock_last_sent >= self.brake_command_retry_sec):
+                self.charge_lock_last_sent = now
+                return self._joy_press(BTN_X)
+            return self._make_joy()
 
         if self.charge_state == ChargeState.CHARGING:
+            # A full plan is fixed at admission so a transiently-clear peer
+            # cannot expand a short shared slot.  It may only shrink if a peer
+            # becomes an active claimant while we are charging.
+            if self.mode == DrivingMode.AGGRESSIVE:
+                one_lap_target = self.aggressive_one_lap_target_power()
+                if (
+                        (
+                            self._aggressive_charger_is_contended()
+                            or self._aggressive_peer_requires_handoff()
+                        )
+                        and self.active_charge_target > one_lap_target):
+                    self.active_charge_target = one_lap_target
+                    target_power = one_lap_target
+                    rospy.loginfo(
+                        "[VirtualDriver/%s] Shortened charge plan to %.1f%% for peer",
+                        self.robot_name,
+                        target_power,
+                    )
+                else:
+                    target_power = self.active_charge_target
+
             if self.power_level >= target_power:
                 if wait_for_merge and self._merge_zone_occupied_by_other():
                     return self._merge_wait_msg()
                 self.charge_state = ChargeState.IDLE
+                if self.mode == DrivingMode.AGGRESSIVE:
+                    self.charge_session_count += 1
+                    self._publish_aggressive_budget()
+                # Start the next energy sample after the charge.  The lap that
+                # led into this stop is intentionally discarded; the following
+                # uncharged lap is the first valid calibration sample.
+                self.lap_start_power = self.power_level
+                self.charged_since_lap_start = False
                 self.waiting_for_merge = False
                 self.merge_release_sent = False
                 self.leaving_charge = True
+                self.active_charge_target = POWER_CHARGE_FULL
+                self.active_charge_target_reason = ""
                 rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Charge complete, releasing brake")
                 return self._joy_press(BTN_B, BTN_X)
             return self._joy_press(BTN_Y)
@@ -960,7 +1377,9 @@ class VirtualDriver:
         if strategy is None:
             return
 
+        self._publish_charge_status()
         self.joy_pub.publish(strategy.decide(self, self.actions))
+        self._publish_charge_status()
 
 
 # ---------------------------------------------------------------------------
