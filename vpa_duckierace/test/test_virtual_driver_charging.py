@@ -120,6 +120,8 @@ def _driver(robot_name="lucas"):
     driver.brake_command_retry_sec = 0.8
     driver.charger_status_timeout_sec = 2.0
     driver.local_brake = False
+    driver.current_speed = DRIVER.SPEED_START
+    driver.speed_offset = 0
     driver.in_fuel_zone = False
     driver.in_merge_zone = False
     driver.waiting_for_fuel = False
@@ -132,7 +134,10 @@ def _driver(robot_name="lucas"):
     driver.fuel_wait_brake_last_sent = None
     driver.charge_state = DRIVER.ChargeState.IDLE
     driver.active_charge_target = 95.0
+    driver.active_charge_target_reason = ""
     driver.charge_session_count = 0
+    driver.charge_lock_last_sent = None
+    driver.brake_released = False
     driver.lap_count = 0.0
     driver.last_lap_count = None
     driver.lap_start_power = 75.0
@@ -142,6 +147,7 @@ def _driver(robot_name="lucas"):
     driver.charge_sessions_pub = _Publisher()
     driver.charge_request_pub = _Publisher()
     driver.charger_claim_pub = _Publisher()
+    driver.mode_pub = _Publisher()
     return driver
 
 
@@ -270,8 +276,32 @@ class VirtualDriverChargingTests(unittest.TestCase):
     def test_waiting_car_still_sends_a_brake_command(self):
         driver = _driver()
         driver.waiting_for_fuel = True
-        message = driver._charge_gate_wait_msg()
+        message = driver._charge_gate_wait_msg(retry_brake=True)
         self.assertEqual(1, message.buttons[DRIVER.BTN_X])
+
+    def test_conservative_mode_does_not_enter_aggressive_gate_arbitration(self):
+        driver = _driver()
+        driver.mode = DRIVER.DrivingMode.CONSERVATIVE
+        driver.power_level = 50.0
+        driver.in_charge_gate = True
+
+        DRIVER.ConservativeStrategy().decide(driver, DRIVER.DriverActions(driver))
+
+        self.assertTrue(driver.seeking_fuel)
+        self.assertFalse(driver.waiting_for_fuel)
+        self.assertEqual(0.0, driver.charge_gate_arbitration_until)
+
+    def test_non_aggressive_laps_do_not_train_the_aggressive_energy_model(self):
+        driver = _driver()
+        driver.mode = DRIVER.DrivingMode.COOPERATIVE
+        driver.last_lap_count = 0.0
+        driver.lap_start_power = 100.0
+        driver.power_level = 40.0
+
+        driver._cb_lap_count(DRIVER.Float32(data=1.0))
+
+        self.assertFalse(driver.battery_per_lap_learned)
+        self.assertEqual(70.0, driver.aggressive_battery_per_lap_estimate)
 
     def test_finished_charge_exits_before_reconsidering_start_threshold(self):
         driver = _driver()

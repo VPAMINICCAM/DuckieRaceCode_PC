@@ -167,8 +167,8 @@ class DriverActions:
     def slow_for_charge_gate(self) -> Joy:
         return self.driver._charge_gate_slow_msg()
 
-    def wait_at_charge_gate(self) -> Joy:
-        return self.driver._charge_gate_wait_msg()
+    def wait_at_charge_gate(self, retry_brake: bool = False) -> Joy:
+        return self.driver._charge_gate_wait_msg(retry_brake=retry_brake)
 
     def wait_at_merge(self) -> Joy:
         return self.driver._merge_wait_msg()
@@ -204,30 +204,35 @@ class DrivingStrategyBase:
     def waits_for_charge_gate_priority(self, driver) -> bool:
         return False
 
+    def uses_aggressive_charge_policy(self, driver) -> bool:
+        """Whether this strategy opts into the learned shared-charger policy."""
+        return False
+
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
         return actions.idle()
 
     def decide(self, driver, actions: DriverActions) -> Joy:
+        aggressive_policy = self.uses_aggressive_charge_policy(driver)
+
         if driver.charge_state != ChargeState.IDLE:
             return actions.charge(
-                driver.active_charge_target,
+                (driver.active_charge_target if aggressive_policy
+                 else self.charge_target_power(driver)),
                 self.waits_for_merge_occupancy(driver))
 
-        # A gate observation is intentionally short-lived, but a car that has
-        # stopped to yield must remain stopped until the charger is available.
-        # Otherwise it resumes normal driving as soon as the raw camera pulse
-        # falls false.
-        if driver.waiting_for_fuel:
+        # This persistent handoff state is specific to aggressive mode.  The
+        # other strategies retain their existing simple charge-zone behavior.
+        if aggressive_policy and driver.waiting_for_fuel:
             if driver.in_fuel_zone:
                 driver.waiting_for_fuel = False
                 driver.seeking_fuel = False
                 driver._clear_charge_gate_arbitration()
             elif driver._charge_gate_arbitrating():
-                return actions.wait_at_charge_gate()
+                return actions.wait_at_charge_gate(retry_brake=True)
             elif (self.waits_for_fuel_occupancy(driver)
                   and (driver._charger_occupied_by_other()
                        or self.waits_for_charge_gate_priority(driver))):
-                return actions.wait_at_charge_gate()
+                return actions.wait_at_charge_gate(retry_brake=True)
             else:
                 driver.waiting_for_fuel = False
                 driver.seeking_fuel = True
@@ -239,18 +244,27 @@ class DrivingStrategyBase:
         if driver.seeking_fuel:
             if driver.in_fuel_zone:
                 driver.seeking_fuel = False
-                driver._clear_charge_gate_arbitration()
+                if aggressive_policy:
+                    driver._clear_charge_gate_arbitration()
             elif (self.waits_for_fuel_occupancy(driver)
-                    and driver._charger_occupied_by_other()):
+                  and (driver._charger_occupied_by_other()
+                       if aggressive_policy
+                       else driver._active_charge_fuel_occupied_by_other())):
                 driver.seeking_fuel = False
-                driver.waiting_for_fuel = True
-                driver._reset_gate_release_retry()
+                if aggressive_policy:
+                    driver.waiting_for_fuel = True
+                    driver._reset_gate_release_retry()
+                    return actions.wait_at_charge_gate(retry_brake=True)
+                driver.gate_release_sent = False
                 return actions.wait_at_charge_gate()
             elif self.defers_charge_for_peer(driver):
                 driver.seeking_fuel = False
-                driver._reset_gate_release_retry()
+                if aggressive_policy:
+                    driver._reset_gate_release_retry()
+                else:
+                    driver.gate_release_sent = False
                 return self.normal_drive(driver, actions)
-            elif driver.local_brake:
+            elif aggressive_policy and driver.local_brake:
                 return driver._release_gate_brake_if_due(actions)
             else:
                 return actions.slow_for_charge_gate()
@@ -258,16 +272,20 @@ class DrivingStrategyBase:
         # A completed charging slot must exit the fuel area before evaluating
         # demand again; a one-lap target can intentionally remain below the
         # early-start threshold while another car is waiting.
-        if driver.leaving_charge:
+        if aggressive_policy and driver.leaving_charge:
             if driver.in_merge_zone:
                 driver.leaving_charge = False
             else:
                 return actions.hold_yellow_line()
 
         if driver.in_fuel_zone and self.wants_charge(driver):
-            driver._begin_charge(self.charge_target_power(driver))
+            if aggressive_policy:
+                driver._begin_charge(self.charge_target_power(driver))
+            else:
+                driver.charge_state = ChargeState.LOCKING
             return actions.charge(
-                driver.active_charge_target,
+                (driver.active_charge_target if aggressive_policy
+                 else self.charge_target_power(driver)),
                 self.waits_for_merge_occupancy(driver))
 
         if driver.in_fuel_zone:
@@ -280,33 +298,62 @@ class DrivingStrategyBase:
                 if joy_msg is not None:
                     return joy_msg
 
+        if not aggressive_policy and driver.leaving_charge:
+            if driver.in_merge_zone:
+                driver.leaving_charge = False
+            else:
+                return actions.hold_yellow_line()
+
+        at_charge_gate = (
+            driver._at_charge_gate() if aggressive_policy
+            else driver._raw_at_charge_gate())
         if (self.wants_charge(driver)
-                and driver._at_charge_gate()
+                and at_charge_gate
                 and not driver.in_fuel_zone):
-            if not driver._charge_gate_arbitrating():
-                driver._start_charge_gate_arbitration()
-                driver.waiting_for_fuel = True
+            if aggressive_policy:
+                if not driver._charge_gate_arbitrating():
+                    driver._start_charge_gate_arbitration()
+                    driver.waiting_for_fuel = True
+                    driver._reset_gate_release_retry()
+                    return actions.wait_at_charge_gate(retry_brake=True)
+                if (self.waits_for_fuel_occupancy(driver)
+                        and (driver._charger_occupied_by_other()
+                             or self.waits_for_charge_gate_priority(driver))):
+                    driver.waiting_for_fuel = True
+                    driver._reset_gate_release_retry()
+                    return actions.wait_at_charge_gate(retry_brake=True)
+                # Persist admission before toggling the brake.  This keeps the
+                # car on the yellow line if the gate pulse expires meanwhile.
+                driver.seeking_fuel = True
+                driver.waiting_for_fuel = False
+                driver._clear_charge_gate_arbitration()
+                if driver.local_brake:
+                    return driver._release_gate_brake_if_due(actions)
                 driver._reset_gate_release_retry()
-                return actions.wait_at_charge_gate()
+                return actions.slow_for_charge_gate()
+
             if (self.waits_for_fuel_occupancy(driver)
-                    and (driver._charger_occupied_by_other()
+                    and (driver._active_charge_fuel_occupied_by_other()
                          or self.waits_for_charge_gate_priority(driver))):
-                driver.waiting_for_fuel = True
-                driver._reset_gate_release_retry()
+                driver.gate_release_sent = False
                 return actions.wait_at_charge_gate()
-            # Persist the admission before toggling the brake.  This keeps the
-            # car on the yellow line even if the gate pulse expires meanwhile.
-            driver.seeking_fuel = True
-            driver.waiting_for_fuel = False
-            driver._clear_charge_gate_arbitration()
             if driver.local_brake:
-                return driver._release_gate_brake_if_due(actions)
-            driver._reset_gate_release_retry()
+                driver.waiting_for_fuel = False
+                if not driver.gate_release_sent:
+                    driver.gate_release_sent = True
+                    return actions.release_brake()
+                return actions.idle()
+            driver.waiting_for_fuel = False
+            driver.gate_release_sent = False
+            driver.seeking_fuel = True
             return actions.slow_for_charge_gate()
 
         driver.waiting_for_fuel = False
-        driver._clear_charge_gate_arbitration()
-        driver._reset_gate_release_retry()
+        if aggressive_policy:
+            driver._clear_charge_gate_arbitration()
+            driver._reset_gate_release_retry()
+        else:
+            driver.gate_release_sent = False
         return self.normal_drive(driver, actions)
 
 
@@ -319,6 +366,9 @@ class ConservativeStrategy(DrivingStrategyBase):
 
 
 class AggressiveStrategy(DrivingStrategyBase):
+    def uses_aggressive_charge_policy(self, driver) -> bool:
+        return driver.mode == DrivingMode.AGGRESSIVE
+
     def wants_charge(self, driver) -> bool:
         if not driver.aggressive_charge_demand():
             return False
@@ -695,6 +745,11 @@ class VirtualDriver:
         self.front_range_stamp = now
 
     def _cb_lap_count(self, msg: Float32):
+        # The lap-energy model is meaningful only for the aggressive driving
+        # profile; conservative/cooperative/adaptive modes must not tune it.
+        if self.mode != DrivingMode.AGGRESSIVE:
+            return
+
         new_lap_count = msg.data
 
         if self.last_lap_count is None:
@@ -760,7 +815,10 @@ class VirtualDriver:
             self.leaving_charge = False
             self.charge_gate_until = 0.0
             self.charge_gate_arbitration_until = 0.0
-        elif not msg.data and self.global_brake:
+        elif (
+                not msg.data
+                and self.global_brake
+                and self.mode == DrivingMode.AGGRESSIVE):
             # The GUI resets power independently of /reset_laps.  Race start
             # is therefore the reliable point to establish a fresh baseline.
             self._reset_aggressive_learning()
@@ -768,7 +826,7 @@ class VirtualDriver:
         self._publish_charge_status()
 
     def _cb_reset_laps(self, msg: Bool):
-        if not msg.data:
+        if not msg.data or self.mode != DrivingMode.AGGRESSIVE:
             return
         self._reset_aggressive_learning()
 
@@ -799,7 +857,12 @@ class VirtualDriver:
             rospy.loginfo(
                 f"[VirtualDriver/{self.robot_name}] Mode -> {self.mode.value}")
             self.mode_pub.publish(String(data=self.mode.value))
-            self._publish_charge_status()
+            if self.mode == DrivingMode.AGGRESSIVE:
+                # Entering aggressive mode starts a fresh calibration interval;
+                # samples collected under another driving profile are invalid.
+                self._reset_aggressive_learning()
+            else:
+                self._publish_charge_status()
 
     def _make_power_cb(self, name: str):
         def cb(msg: Float32):
@@ -938,6 +1001,10 @@ class VirtualDriver:
             or bool(self._active_charge_gate_cameras())
             or self.charge_gate_until > rospy.Time.now().to_sec()
         )
+
+    def _raw_at_charge_gate(self) -> bool:
+        """Direct zone state for non-aggressive strategies."""
+        return self.in_charge_gate or bool(self._active_charge_gate_cameras())
 
     def _active_charge_fuel_occupied_by_other(self) -> bool:
         for cam in self._active_charge_gate_cameras():
@@ -1250,7 +1317,14 @@ class VirtualDriver:
         self._step_speed_down_to(STEPS_TO_HALF, buttons)
         return self._make_joy(buttons=buttons)
 
-    def _charge_gate_wait_msg(self) -> Joy:
+    def _charge_gate_wait_msg(self, retry_brake: bool = False) -> Joy:
+        if not retry_brake:
+            if not self.local_brake and not self.waiting_for_fuel:
+                self.waiting_for_fuel = True
+                return self._joy_press(BTN_X)
+            self.waiting_for_fuel = True
+            return self._make_joy()
+
         if not self.local_brake:
             now = rospy.Time.now().to_sec()
             if (
