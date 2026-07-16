@@ -58,6 +58,9 @@ Parameters
 
 import rospy
 import math
+import os
+import pickle
+import random
 from sensor_msgs.msg import Joy, Range
 from std_msgs.msg import Bool, Float32, String, UInt32
 from enum import Enum
@@ -73,6 +76,7 @@ class DrivingMode(Enum):
     AGGRESSIVE   = "aggressive"
     COOPERATIVE  = "cooperative"
     ADAPTIVE     = "adaptive"
+    QLEARNING    = "qlearning"
 
 
 class ChargeState(Enum):
@@ -103,6 +107,9 @@ STEPS_TO_HALF = 0  # 50% in the GUI speed scale maps to SPEED_START.
 POWER_CRITICAL    = 15.0   # % - charge now regardless of mode
 CONSERVATIVE_CHARGE_START = 55.0  # % - conservative robot starts seeking charge below this
 POWER_CHARGE_FULL = 95.0   # % - stop charging above this
+QLEARNING_ALPHA   = 0.15
+QLEARNING_GAMMA   = 0.90
+QLEARNING_EPSILON = 0.25
 COOP_CHARGE_SELF  = 50.0   # % - cooperative robot charges below this
 COOP_CHARGE_PEER  = 30.0   # % - cooperative robot yields if peer < this
 
@@ -220,6 +227,16 @@ class DrivingStrategyBase:
                  else self.charge_target_power(driver)),
                 self.waits_for_merge_occupancy(driver))
 
+        # Hard emergency stop for non-aggressive modes.  Aggressive has its own
+        # TTC + distance safety logic inside normal_drive; skip the check there
+        # to avoid interfering with its more nuanced slow/overtake state machine.
+        if not aggressive_policy and not driver.local_brake:
+            if (driver.front_range_stamp is not None
+                    and rospy.Time.now().to_sec() - driver.front_range_stamp
+                    < AGGRESSIVE_RANGE_STALE_SEC
+                    and driver.tof_range < AGGRESSIVE_EMERGENCY_DISTANCE):
+                return actions.press(BTN_X)
+
         # This persistent handoff state is specific to aggressive mode.  The
         # other strategies retain their existing simple charge-zone behavior.
         if aggressive_policy and driver.waiting_for_fuel:
@@ -304,9 +321,10 @@ class DrivingStrategyBase:
             else:
                 return actions.hold_yellow_line()
 
-        at_charge_gate = (
-            driver._at_charge_gate() if aggressive_policy
-            else driver._raw_at_charge_gate())
+        # Use the latched version for all modes: at 2 Hz a brief gate detection
+        # can expire before the next control tick, causing the robot to miss its
+        # window to enter seeking_fuel.
+        at_charge_gate = driver._at_charge_gate()
         if (self.wants_charge(driver)
                 and at_charge_gate
                 and not driver.in_fuel_zone):
@@ -448,11 +466,119 @@ class AdaptiveStrategy(DrivingStrategyBase):
         return driver._make_joy(buttons=buttons)
 
 
+class QLearningStrategy(DrivingStrategyBase):
+    ACTIONS = ["conservative", "aggressive", "charge"]
+
+    def __init__(self):
+        self.q_table = {}
+        self.last_state = {}
+        self.last_action = {}
+        self.chosen_action = {}
+
+    def _discrete_state(self, driver):
+        power = 0 if driver.power_level < 30.0 else 1 if driver.power_level < 70.0 else 2
+        obstacle = 1 if driver.tof_range < OVERTAKE_DIST else 0
+        in_fuel = 1 if driver.in_fuel_zone else 0
+        in_merge = 1 if driver.in_merge_zone else 0
+        return (power, obstacle, in_fuel, in_merge)
+
+    def _get_q(self, state, action):
+        return self.q_table.get((state, action), 0.0)
+
+    def _best_future_q(self, state):
+        return max(self._get_q(state, action) for action in self.ACTIONS)
+
+    def _choose_action(self, driver, state):
+        if random.random() < QLEARNING_EPSILON:
+            return random.choice(self.ACTIONS)
+        return max(
+            self.ACTIONS,
+            key=lambda action: self._get_q(state, action)
+        )
+
+    def _reward(self, driver, action):
+        reward = 0.0
+        reward += (driver.power_level - 50.0) / 50.0
+        reward += max(-1.0, min(1.0, driver.speed_offset / float(STEPS_TO_MAX)))
+        if driver.power_level < POWER_CRITICAL:
+            reward -= 1.5
+        if action == "charge" and driver.power_level < 70.0:
+            reward += 0.8
+        if action == "aggressive" and driver.power_level > 40.0:
+            reward += 0.2
+        if action == "conservative" and driver.power_level < 40.0:
+            reward += 0.2
+        if driver.in_fuel_zone and driver.charge_state == ChargeState.CHARGING:
+            reward += 1.0
+        if driver.in_merge_zone and driver.local_brake:
+            reward -= 0.3
+        return reward
+
+    def _update_q(self, driver, prev_state, prev_action, next_state, reward):
+        old_value = self._get_q(prev_state, prev_action)
+        future_best = self._best_future_q(next_state)
+        self.q_table[(prev_state, prev_action)] = (
+            old_value + QLEARNING_ALPHA *
+            (reward + QLEARNING_GAMMA * future_best - old_value)
+        )
+
+    def wants_charge(self, driver) -> bool:
+        # Action is chosen once per timestep in decide(); this just reads it.
+        # Calling _choose_action() here would re-roll epsilon-greedy on every
+        # call and corrupt last_action used by the Q-update next timestep.
+        return self.chosen_action.get(driver.robot_name, "conservative") == "charge"
+
+    def normal_drive(self, driver, actions: DriverActions) -> Joy:
+        action = self.chosen_action.get(driver.robot_name, "conservative")
+        if action == "aggressive":
+            return AggressiveStrategy().normal_drive(driver, actions)
+        return ConservativeStrategy().normal_drive(driver, actions)
+
+    def decide(self, driver, actions: DriverActions) -> Joy:
+        name = driver.robot_name
+        state = self._discrete_state(driver)
+        if name in self.last_state and name in self.last_action:
+            reward = self._reward(driver, self.last_action[name])
+            self._update_q(
+                driver,
+                self.last_state[name],
+                self.last_action[name],
+                state,
+                reward)
+        # Choose the action exactly once per timestep before base class calls
+        # wants_charge() or normal_drive().
+        action = self._choose_action(driver, state)
+        self.chosen_action[name] = action
+        self.last_state[name] = state
+        self.last_action[name] = action
+        return super().decide(driver, actions)
+
+    def save(self, path: str):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                pickle.dump(self.q_table, f)
+            rospy.loginfo("[QLearning] Q-table saved to %s (%d entries)", path, len(self.q_table))
+        except Exception as e:
+            rospy.logwarn("[QLearning] Could not save Q-table: %s", e)
+
+    def load(self, path: str):
+        try:
+            with open(path, "rb") as f:
+                self.q_table = pickle.load(f)
+            rospy.loginfo("[QLearning] Q-table loaded from %s (%d entries)", path, len(self.q_table))
+        except FileNotFoundError:
+            rospy.loginfo("[QLearning] No saved Q-table at %s, starting fresh", path)
+        except Exception as e:
+            rospy.logwarn("[QLearning] Could not load Q-table: %s", e)
+
+
 STRATEGIES = {
     DrivingMode.CONSERVATIVE: ConservativeStrategy(),
     DrivingMode.AGGRESSIVE: AggressiveStrategy(),
     DrivingMode.COOPERATIVE: CooperativeStrategy(),
     DrivingMode.ADAPTIVE: AdaptiveStrategy(),
+    DrivingMode.QLEARNING: QLearningStrategy(),
 }
 
 
@@ -668,6 +794,13 @@ class VirtualDriver:
                     f"/{robot}/{cam}/in_fuel_zone", Bool,
                     self._make_other_camera_fuel_cb(robot, cam))
 
+        # ---- Q-learning persistence ------------------------------------------
+        if self.mode == DrivingMode.QLEARNING:
+            self._q_table_path = os.path.expanduser(
+                f"~/.ros/q_table_{self.robot_name}.pkl")
+            STRATEGIES[DrivingMode.QLEARNING].load(self._q_table_path)
+            rospy.on_shutdown(self._save_q_table)
+
         # ---- Control timer ----------------------------------------------------
         rospy.Timer(rospy.Duration(1.0 / self.control_rate), self._control_loop)
 
@@ -677,6 +810,9 @@ class VirtualDriver:
         self.mode_pub.publish(String(data=self.mode.value))
         self._publish_aggressive_budget()
         self._publish_charge_status()
+
+    def _save_q_table(self):
+        STRATEGIES[DrivingMode.QLEARNING].save(self._q_table_path)
 
     # ==========================================================================
     # Callbacks

@@ -16,7 +16,8 @@
       conservative - low speed, charges whenever in the fuel zone
       aggressive   - max speed, charges only when critically low
       cooperative  - medium speed, yields at obstacles, shares fuel zone fairly
-      adaptive     - switches strategy automatically based on power level
+      adaptive     - switches strategy automatically between aggressive / conservative based on power level
+      qlearning    - learns by balancing speed, charging, and obstacles
 
     Usage examples
     ==============
@@ -35,9 +36,9 @@
   -->
 
   <arg name="lucas_mode" default="conservative"
-       doc="Initial behavior mode for lucas: manual|conservative|aggressive|cooperative|adaptive" />
+       doc="Initial behavior mode for lucas: manual|conservative|aggressive|cooperative|adaptive|qlearning" />
   <arg name="daisy_mode" default="conservative"
-       doc="Initial behavior mode for daisy: manual|conservative|aggressive|cooperative|adaptive" />
+       doc="Initial behavior mode for daisy: manual|conservative|aggressive|cooperative|adaptive|qlearning" />
   <arg name="control_rate" default="2.0"
        doc="Control loop frequency [Hz]. Keep at most 1/0.3 ~= 3.3 to match duckierace debounce." />
   <!-- Shared aggressive charging policy.  The defaults use the observed
