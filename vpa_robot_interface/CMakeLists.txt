@@ -9,6 +9,7 @@ project(vpa_robot_interface)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   rospy
+  sensor_msgs
   std_msgs
   message_generation
   dynamic_reconfigure
@@ -109,8 +110,7 @@ generate_dynamic_reconfigure_options(
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
 #  INCLUDE_DIRS include
- LIBRARIES vpa_robot_interface
-CATKIN_DEPENDS rospy message_runtime
+CATKIN_DEPENDS rospy sensor_msgs std_msgs message_runtime
 #  DEPENDS system_lib
 )
 

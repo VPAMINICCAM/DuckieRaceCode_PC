@@ -36,9 +36,9 @@ if PKG_DIR not in sys.path:
 from q_table.q_agent import (ACTION_CHARGE, ACTION_DRIVE, ZONE_FUEL,
                               ZONE_GATE, ZONE_MERGE, ZONE_TRACK, QAgent)
 
-# ── button indices (match keyboard_joy_console.py — physical robot ref) ─────
-BTN_B  = 1   # yellow-line follow / fuel-zone brake unlock
-BTN_X  = 2   # brake toggle
+# ── button indices (physical robot and virtual-driver contract) ─────────
+BTN_X  = 0   # brake toggle
+BTN_B  = 2   # yellow-line follow / fuel-zone brake unlock
 BTN_Y  = 3   # enable charging
 BTN_L1 = 4   # speed step up
 BTN_R1 = 5   # speed step down

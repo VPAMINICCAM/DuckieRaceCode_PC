@@ -13,3 +13,4 @@ test
 !test/
 test/*
 !test/test_virtual_driver_charging.py
+!test/test_control_contracts.py

@@ -1,0 +1,44 @@
+<launch>
+  <arg name="robot_name" value="$(env robot_name)"/>
+  <arg name="race_duration" default="300.0"/>
+  <arg name="charge_safety_margin" default="10.0"/>
+  <arg name="lane_kd" default="0.4"/>
+  <arg name="initial_power" default="$(optenv DUCKIERACE_INITIAL_POWER 75.0)"/>
+
+  <!-- The main-PC virtual driver owns charging during a race.  Local
+       autonomous charging remains available only as an explicit opt-in. -->
+  <arg name="autonomous_mode" default="false"/>
+
+  <arg name="use_physical_joy" default="false"/>
+  <arg name="joy_dev" default="/dev/input/js0"/>
+  <!-- Daisy has the sensor; Lucas does not launch one.  The argument remains
+       overridable for replacement hardware or bench testing. -->
+  <arg name="use_tof" default="$(eval arg('robot_name') == 'daisy')"/>
+  <arg name="tof_interface" default="i2c"/>
+
+  <group ns="$(arg robot_name)">
+    <include file="$(find vpa_robot_interface)/launch/vpa_camera.launch"/>
+    <include file="$(find vpa_robot_interface)/launch/vpa_traction_start.launch"/>
+
+    <node name="joy_node" pkg="joy" type="joy_node"
+          if="$(arg use_physical_joy)">
+      <param name="dev" value="$(arg joy_dev)"/>
+    </node>
+
+    <node name="dr_line_follower" pkg="vpa_robot_operation"
+          type="duckierace.py" output="screen">
+      <param name="kd" value="$(arg lane_kd)"/>
+      <param name="robot_name" value="$(arg robot_name)"/>
+      <param name="initial_power" value="$(arg initial_power)"/>
+      <param name="race_duration" value="$(arg race_duration)"/>
+      <param name="charge_safety_margin" value="$(arg charge_safety_margin)"/>
+      <param name="autonomous_mode" value="$(arg autonomous_mode)"/>
+    </node>
+
+    <!-- vpa_tof.launch intentionally adds no nested namespace. -->
+    <include file="$(find vpa_robot_interface)/launch/vpa_tof.launch"
+             if="$(arg use_tof)">
+      <arg name="interface" value="$(arg tof_interface)"/>
+    </include>
+  </group>
+</launch>

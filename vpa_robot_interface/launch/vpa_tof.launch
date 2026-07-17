@@ -1,4 +1,7 @@
 <launch>
+    <!-- Include this file inside the robot namespace.  Do not add another
+         "robot" namespace here: publishers must resolve directly to
+         /<robot>/front_range and /<robot>/front_range_status. -->
     <arg name="interface" default="i2c"/>
     <group if="$(eval interface== 'i2c')">
         <node name="tof_sensor" pkg="vpa_robot_interface" type="tof_driver_i2c.py" output="screen" required="true"/>

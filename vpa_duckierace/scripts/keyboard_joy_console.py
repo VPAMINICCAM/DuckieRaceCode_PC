@@ -11,8 +11,8 @@ from sensor_msgs.msg import Joy
 from std_msgs.msg import Bool
 
 
-BTN_B = 1
-BTN_X = 2
+BTN_X = 0
+BTN_B = 2
 BTN_Y = 3
 BTN_L1 = 4
 BTN_R1 = 5
