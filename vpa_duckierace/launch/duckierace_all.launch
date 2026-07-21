@@ -4,6 +4,21 @@
   <arg name="daisy_mode" default="conservative" />
   <arg name="control_rate" default="2.0" />
   <arg name="all_robots" default="[lucas, daisy]" />
+  <arg name="anticollision_enabled" default="true" />
+  <arg name="lucas_anticollision_sensor_required" default="false" />
+  <arg name="daisy_anticollision_sensor_required" default="true" />
+  <arg name="anticollision_safety_rate" default="10.0" />
+  <arg name="front_range_stale_sec" default="1.0" />
+  <arg name="conservative_safe_distance" default="0.55" />
+  <arg name="conservative_emergency_distance" default="0.30" />
+  <arg name="conservative_resume_distance" default="0.42" />
+  <arg name="conservative_ttc_slow" default="2.5" />
+  <arg name="conservative_ttc_brake" default="1.2" />
+  <arg name="aggressive_safe_distance" default="0.45" />
+  <arg name="aggressive_emergency_distance" default="0.18" />
+  <arg name="aggressive_resume_distance" default="0.28" />
+  <arg name="aggressive_ttc_slow" default="2.0" />
+  <arg name="aggressive_ttc_brake" default="0.8" />
 
   <include file="$(find vpa_duckierace)/launch/start_racecontrol.launch" />
 
@@ -12,6 +27,21 @@
     <arg name="daisy_mode" value="$(arg daisy_mode)" />
     <arg name="control_rate" value="$(arg control_rate)" />
     <arg name="all_robots" value="$(arg all_robots)" />
+    <arg name="anticollision_enabled" value="$(arg anticollision_enabled)" />
+    <arg name="lucas_anticollision_sensor_required" value="$(arg lucas_anticollision_sensor_required)" />
+    <arg name="daisy_anticollision_sensor_required" value="$(arg daisy_anticollision_sensor_required)" />
+    <arg name="anticollision_safety_rate" value="$(arg anticollision_safety_rate)" />
+    <arg name="front_range_stale_sec" value="$(arg front_range_stale_sec)" />
+    <arg name="conservative_safe_distance" value="$(arg conservative_safe_distance)" />
+    <arg name="conservative_emergency_distance" value="$(arg conservative_emergency_distance)" />
+    <arg name="conservative_resume_distance" value="$(arg conservative_resume_distance)" />
+    <arg name="conservative_ttc_slow" value="$(arg conservative_ttc_slow)" />
+    <arg name="conservative_ttc_brake" value="$(arg conservative_ttc_brake)" />
+    <arg name="aggressive_safe_distance" value="$(arg aggressive_safe_distance)" />
+    <arg name="aggressive_emergency_distance" value="$(arg aggressive_emergency_distance)" />
+    <arg name="aggressive_resume_distance" value="$(arg aggressive_resume_distance)" />
+    <arg name="aggressive_ttc_slow" value="$(arg aggressive_ttc_slow)" />
+    <arg name="aggressive_ttc_brake" value="$(arg aggressive_ttc_brake)" />
   </include>
 
   <node name="global_brake_latch"

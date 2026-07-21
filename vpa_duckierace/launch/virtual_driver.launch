@@ -41,6 +41,24 @@
        doc="Initial behavior mode for daisy: manual|conservative|aggressive|cooperative|adaptive|qlearning" />
   <arg name="control_rate" default="2.0"
        doc="Control loop frequency [Hz]. Keep at most 1/0.3 ~= 3.3 to match duckierace debounce." />
+  <!-- Front-range anti-collision profiles.  A robot needs a live
+       /<robot>/front_range topic for these settings to take effect. -->
+  <arg name="anticollision_enabled" default="true" />
+  <!-- Lucas has no ToF in the default hardware profile; Daisy does. -->
+  <arg name="lucas_anticollision_sensor_required" default="false" />
+  <arg name="daisy_anticollision_sensor_required" default="true" />
+  <arg name="anticollision_safety_rate" default="10.0" />
+  <arg name="front_range_stale_sec" default="1.0" />
+  <arg name="conservative_safe_distance" default="0.55" />
+  <arg name="conservative_emergency_distance" default="0.30" />
+  <arg name="conservative_resume_distance" default="0.42" />
+  <arg name="conservative_ttc_slow" default="2.5" />
+  <arg name="conservative_ttc_brake" default="1.2" />
+  <arg name="aggressive_safe_distance" default="0.45" />
+  <arg name="aggressive_emergency_distance" default="0.18" />
+  <arg name="aggressive_resume_distance" default="0.28" />
+  <arg name="aggressive_ttc_slow" default="2.0" />
+  <arg name="aggressive_ttc_brake" default="0.8" />
   <!-- Shared aggressive charging policy.  The defaults use the observed
        first-race consumption as a conservative prior, then learn per robot. -->
   <arg name="aggressive_battery_per_lap_default" default="70.0" />
@@ -66,6 +84,21 @@
     <param name="robot_name"   value="lucas" />
     <param name="driving_mode" value="$(arg lucas_mode)" />
     <param name="control_rate" value="$(arg control_rate)" />
+    <param name="anticollision_enabled" value="$(arg anticollision_enabled)" />
+    <param name="anticollision_sensor_required" value="$(arg lucas_anticollision_sensor_required)" />
+    <param name="anticollision_safety_rate" value="$(arg anticollision_safety_rate)" />
+    <param name="front_range_stale_sec" value="$(arg front_range_stale_sec)" />
+    <param name="conservative_safe_distance" value="$(arg conservative_safe_distance)" />
+    <param name="conservative_emergency_distance" value="$(arg conservative_emergency_distance)" />
+    <param name="conservative_resume_distance" value="$(arg conservative_resume_distance)" />
+    <param name="conservative_ttc_slow" value="$(arg conservative_ttc_slow)" />
+    <param name="conservative_ttc_brake" value="$(arg conservative_ttc_brake)" />
+    <param name="aggressive_safe_distance" value="$(arg aggressive_safe_distance)" />
+    <param name="aggressive_emergency_distance" value="$(arg aggressive_emergency_distance)" />
+    <param name="aggressive_resume_distance" value="$(arg aggressive_resume_distance)" />
+    <param name="aggressive_ttc_slow" value="$(arg aggressive_ttc_slow)" />
+    <param name="aggressive_ttc_brake" value="$(arg aggressive_ttc_brake)" />
+    <param name="anticollision_command_retry_sec" value="$(arg brake_command_retry_sec)" />
     <param name="aggressive_battery_per_lap_default" value="$(arg aggressive_battery_per_lap_default)" />
     <param name="aggressive_battery_reserve" value="$(arg aggressive_battery_reserve)" />
     <param name="aggressive_calibration_min_power" value="$(arg aggressive_calibration_min_power)" />
@@ -87,6 +120,21 @@
     <param name="robot_name"   value="daisy" />
     <param name="driving_mode" value="$(arg daisy_mode)" />
     <param name="control_rate" value="$(arg control_rate)" />
+    <param name="anticollision_enabled" value="$(arg anticollision_enabled)" />
+    <param name="anticollision_sensor_required" value="$(arg daisy_anticollision_sensor_required)" />
+    <param name="anticollision_safety_rate" value="$(arg anticollision_safety_rate)" />
+    <param name="front_range_stale_sec" value="$(arg front_range_stale_sec)" />
+    <param name="conservative_safe_distance" value="$(arg conservative_safe_distance)" />
+    <param name="conservative_emergency_distance" value="$(arg conservative_emergency_distance)" />
+    <param name="conservative_resume_distance" value="$(arg conservative_resume_distance)" />
+    <param name="conservative_ttc_slow" value="$(arg conservative_ttc_slow)" />
+    <param name="conservative_ttc_brake" value="$(arg conservative_ttc_brake)" />
+    <param name="aggressive_safe_distance" value="$(arg aggressive_safe_distance)" />
+    <param name="aggressive_emergency_distance" value="$(arg aggressive_emergency_distance)" />
+    <param name="aggressive_resume_distance" value="$(arg aggressive_resume_distance)" />
+    <param name="aggressive_ttc_slow" value="$(arg aggressive_ttc_slow)" />
+    <param name="aggressive_ttc_brake" value="$(arg aggressive_ttc_brake)" />
+    <param name="anticollision_command_retry_sec" value="$(arg brake_command_retry_sec)" />
     <param name="aggressive_battery_per_lap_default" value="$(arg aggressive_battery_per_lap_default)" />
     <param name="aggressive_battery_reserve" value="$(arg aggressive_battery_reserve)" />
     <param name="aggressive_calibration_min_power" value="$(arg aggressive_calibration_min_power)" />

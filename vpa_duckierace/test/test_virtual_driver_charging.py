@@ -3,6 +3,7 @@
 
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -85,6 +86,7 @@ def _driver(robot_name="lucas"):
     driver.robot_name = robot_name
     driver.other_robots = [peer]
     driver.mode = DRIVER.DrivingMode.AGGRESSIVE
+    driver.anticollision_lock = threading.RLock()
     driver.global_brake = False
     driver.power_level = 75.0
     driver.aggressive_battery_per_lap_estimate = 70.0
@@ -120,6 +122,7 @@ def _driver(robot_name="lucas"):
     driver.brake_command_retry_sec = 0.8
     driver.charger_status_timeout_sec = 2.0
     driver.local_brake = False
+    driver.driver_brake_active = False
     driver.tof_range = 9.9
     driver.front_range_stamp = None
     driver.current_speed = DRIVER.SPEED_START

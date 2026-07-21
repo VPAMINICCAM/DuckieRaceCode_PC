@@ -2,6 +2,7 @@
 
 import rospy
 import socket
+import threading
 
 from wheel_driver import WheelDriver
 from pid_controller.feedfoward_PID_Absolute import PIDController_Enhanced as PIDController
@@ -30,9 +31,12 @@ class WheelDriverEnhanced(WheelDriver):
 
         rospy.on_shutdown(self.shut_hook)
         self.driver = WheelDriver()
+        self.brake_lock = threading.RLock()
 
         self.estop          = True
         self.local_estop    = True
+        self.driver_estop   = False
+        self.collision_estop = False
 
         self.direct_mode    = rospy.get_param('~direct_mode',False)
 
@@ -75,27 +79,38 @@ class WheelDriverEnhanced(WheelDriver):
 
         self.sub_e_stop         = rospy.Subscriber("/global_brake", Bool, self.estop_cb, queue_size=1)
         self.sub_local_e_stop   = rospy.Subscriber("local_brake", Bool, self.estop_local_cb, queue_size=1)
+        self.sub_driver_stop    = rospy.Subscriber(
+            "driver_brake_active", Bool,
+            self.estop_driver_cb, queue_size=1)
+        self.sub_collision_stop = rospy.Subscriber(
+            "collision_brake_cmd", Bool,
+            self.estop_collision_cb, queue_size=1)
         self.debug_pub = rospy.Publisher("wheel_info", WheelsCmd, queue_size=1)
 
         self.srv_left = Server(omegaConfig, self.dynamic_reconfigure_callback_left, namespace='left_wheel')
         self.srv_right = Server(omegaConfig, self.dynamic_reconfigure_callback_right, namespace='right_wheel')
 
     def estop_cb(self, msg:Bool):
-        if msg.data != self.estop:
-            self.estop = msg.data
+        with self.brake_lock:
+            changed = bool(msg.data) != self.estop
+            self.estop = bool(msg.data)
+            if self.estop:
+                self._stop_motors_locked()
+        if changed:
             rospy.loginfo("%s: Global brake state changed to %s", self.robot_name, self.estop)
     
     def car_cmd_cb(self, msg:Twist):
-        if self.estop or self.local_estop:
-            self.driver.set_wheels_throttle(left=0, right=0)
-            self.left_omega_controller.reset()
-            self.right_omega_controller.reset()
+        with self.brake_lock:
+            return self._car_cmd_cb_locked(msg)
+
+    def _car_cmd_cb_locked(self, msg:Twist):
+        if (self.estop or self.local_estop
+                or self.driver_estop or self.collision_estop):
+            self._stop_motors_locked()
             return
         if msg.linear.x == 0:
             # If no linear velocity, set both wheels to zero throttle
-            self.driver.set_wheels_throttle(left=0, right=0)
-            self.left_omega_controller.reset()
-            self.right_omega_controller.reset()
+            self._stop_motors_locked()
             return
         # Convert linear.x (m/s) and angular.z (rad/s) to wheel angular velocity (rad/s)
         # v = r * omega  =>  omega = v / r
@@ -117,9 +132,41 @@ class WheelDriverEnhanced(WheelDriver):
         self.debug_pub.publish(debug_msg)
 
     def estop_local_cb(self, msg:Bool):
-        if msg.data != self.local_estop:
-            self.local_estop = msg.data
+        with self.brake_lock:
+            changed = bool(msg.data) != self.local_estop
+            self.local_estop = bool(msg.data)
+            if self.local_estop:
+                self._stop_motors_locked()
+        if changed:
             rospy.loginfo("%s: Local brake state changed to %s", self.robot_name, self.local_estop)
+
+    def estop_driver_cb(self, msg: Bool):
+        with self.brake_lock:
+            changed = bool(msg.data) != self.driver_estop
+            self.driver_estop = bool(msg.data)
+            if self.driver_estop:
+                self._stop_motors_locked()
+        if changed:
+            rospy.loginfo(
+                "%s: Driver brake state changed to %s",
+                self.robot_name, self.driver_estop)
+
+    def estop_collision_cb(self, msg: Bool):
+        with self.brake_lock:
+            changed = bool(msg.data) != self.collision_estop
+            self.collision_estop = bool(msg.data)
+            if self.collision_estop:
+                self._stop_motors_locked()
+        if changed:
+            rospy.loginfo(
+                "%s: Collision brake state changed to %s",
+                self.robot_name, self.collision_estop)
+
+    def _stop_motors_locked(self):
+        """Apply a brake synchronously while ``brake_lock`` is held."""
+        self.driver.set_wheels_throttle(left=0, right=0)
+        self.left_omega_controller.reset()
+        self.right_omega_controller.reset()
 
     def wheel_omega_cb(self, msg:WheelsEncoder):
         self.left_omega     = msg.omega_left
@@ -157,9 +204,10 @@ class WheelDriverEnhanced(WheelDriver):
 
     def shut_hook(self):
         rospy.loginfo("%s: Shutting down WheelDrivers", self.robot_name)
-        self.estop = True
-        self.driver.set_wheels_throttle(left=0,right=0)
-        self.driver = None
+        with self.brake_lock:
+            self.estop = True
+            self.driver.set_wheels_throttle(left=0, right=0)
+            self.driver = None
     
 if __name__ == '__main__':
     rospy.init_node('wheel_driver_enhanced', anonymous=False)

@@ -2,6 +2,7 @@
 
 import rospy
 import socket
+import threading
 from math import fabs, floor
 import os
 from dt_config.dt_hardware_settings import MotorDirection, HATv2
@@ -122,6 +123,7 @@ class WheelDriverNode:
         self.direct_mode    = rospy.get_param('~direct_mode',False)
 
         self.driver = WheelDriver()
+        self.brake_lock = threading.RLock()
         script_dir = os.path.dirname(os.path.abspath(__file__))
         filepath = os.path.join(script_dir,'adafruit_drivers/kinematics.py')
         self.log_dir = os.path.join(script_dir, 'logs')
@@ -162,6 +164,11 @@ class WheelDriverNode:
         rospy.loginfo("%s: global brake activated",self.veh_name)
         self.local_estop   = True
         rospy.loginfo("%s: local brake activated",self.veh_name)
+        # Independent collision ownership is enforced at the motor boundary,
+        # so another publisher cannot clear it by writing False to the shared
+        # local_brake topic.
+        self.driver_estop = False
+        self.collision_estop = False
         # Subscribers
         # self.sub_cmd     = rospy.Subscriber("wheels_cmd", WheelsCmd, self.wheels_cmd_cb, queue_size=1)
 
@@ -174,6 +181,12 @@ class WheelDriverNode:
             
         self.sub_e_stop         = rospy.Subscriber("/global_brake", Bool, self.estop_cb, queue_size=1)
         self.sub_local_e_stop   = rospy.Subscriber("local_brake", Bool, self.estop_local_cb, queue_size=1)
+        self.sub_driver_stop    = rospy.Subscriber(
+            "driver_brake_active", Bool,
+            self.estop_driver_cb, queue_size=1)
+        self.sub_collision_stop = rospy.Subscriber(
+            "collision_brake_cmd", Bool,
+            self.estop_collision_cb, queue_size=1)
 
         rospy.Subscriber("robot_interface_shutdown", Bool, self.signal_shut)
         self.dyna_trim = rospy.get_param('~dyna_trim', False)
@@ -196,12 +209,17 @@ class WheelDriverNode:
             rospy.signal_shutdown('wheel driver node shutdown')
 
     def car_cmd_cb(self,msg_car_cmd:Twist) -> None:
+        with self.brake_lock:
+            return self._car_cmd_cb_locked(msg_car_cmd)
+
+    def _car_cmd_cb_locked(self,msg_car_cmd:Twist) -> None:
         msg_car_cmd.linear.x    = max(min(msg_car_cmd.linear.x,self._v_max),-self._v_max)
         msg_car_cmd.angular.z   = max(min(msg_car_cmd.angular.z,self._omega_max),-self._omega_max)
         self.yaw_setpoint = -msg_car_cmd.angular.z  # Negate the yaw setpoint
         self.omega_right_ref    = 0
         self.omega_left_ref     = 0
-        if not self.estop:
+        if (not self.estop and not self.local_estop
+                and not self.driver_estop and not self.collision_estop):
             if msg_car_cmd.linear.x != 0:
                 self.omega_right_ref    = ((msg_car_cmd.linear.x + 0.5 * msg_car_cmd.angular.z * self._baseline) / self._radius) 
                 self.omega_left_ref     = ((msg_car_cmd.linear.x - 0.5 * msg_car_cmd.angular.z * self._baseline) / self._radius) 
@@ -216,17 +234,55 @@ class WheelDriverNode:
         self.pub_wheel_debug.publish(msg_wheel_cmd)
 
     def estop_cb(self,msg:Bool) -> None:
-        self.estop = msg.data
+        with self.brake_lock:
+            self.estop = bool(msg.data)
+            if self.estop:
+                self._stop_motors_locked()
         rospy.loginfo_once('%s: global brake: %s',self.veh_name,str(msg.data))
 
     def estop_local_cb(self,msg:Bool) -> None:
-        self.local_estop = msg.data
+        with self.brake_lock:
+            self.local_estop = bool(msg.data)
+            if self.local_estop:
+                self._stop_motors_locked()
         rospy.loginfo_once('%s: local brake: %s',self.veh_name,str(msg.data))        
+
+    def estop_collision_cb(self, msg: Bool) -> None:
+        with self.brake_lock:
+            self.collision_estop = bool(msg.data)
+            # Discard retained closed-loop references on both assertion and
+            # release.  After a line-follower outage, collision=False must not
+            # restart old motion from recurring encoder callbacks; a fresh
+            # cmd_vel is required to populate references again.
+            self._stop_motors_locked()
+        name = getattr(self, "veh_name", getattr(self, "robot_name", "robot"))
+        rospy.loginfo_once(
+            '%s: collision brake: %s', name, str(self.collision_estop))
+
+    def estop_driver_cb(self, msg: Bool) -> None:
+        with self.brake_lock:
+            self.driver_estop = bool(msg.data)
+            if self.driver_estop:
+                self._stop_motors_locked()
+        name = getattr(self, "veh_name", getattr(self, "robot_name", "robot"))
+        rospy.loginfo_once(
+            '%s: driver brake: %s', name, str(self.driver_estop))
+
+    def _stop_motors_locked(self) -> None:
+        """Apply a brake synchronously while ``brake_lock`` is held."""
+        self.omega_left_ref = 0
+        self.omega_right_ref = 0
+        self.throttle_left = 0
+        self.throttle_right = 0
+        self.driver.set_wheels_throttle(left=0, right=0)
+        self.omega_controller_left.reset()
+        self.omega_controller_right.reset()
     
     def shut_hook(self) -> None:
-        self.estop = True
-        self.driver.set_wheels_throttle(left=0,right=0)
-        self.driver = None
+        with self.brake_lock:
+            self.estop = True
+            self.driver.set_wheels_throttle(left=0,right=0)
+            self.driver = None
         rospy.loginfo("%s: Wheel driver shutdown",self.veh_name)
 
     def wheel_direct_cb(self,msg:WheelsCmd) -> None:
@@ -234,14 +290,19 @@ class WheelDriverNode:
         self.throttle_left  = msg.throttle_left
         self.throttle_right = msg.throttle_right
         
-        if not self.estop and not self.local_estop:
-            self.driver.set_wheels_throttle(left=self.throttle_left,right=self.throttle_right)
-        else:
-            self.driver.set_wheels_throttle(left=0,right=0)
-            self.omega_controller_left.reset()
-            self.omega_controller_right.reset()
+        with self.brake_lock:
+            if (not self.estop and not self.local_estop
+                    and not self.driver_estop and not self.collision_estop):
+                self.driver.set_wheels_throttle(
+                    left=self.throttle_left, right=self.throttle_right)
+            else:
+                self._stop_motors_locked()
     
     def wheel_omega_cb(self,msg:WheelsEncoder) -> None:
+        with self.brake_lock:
+            return self._wheel_omega_cb_locked(msg)
+
+    def _wheel_omega_cb_locked(self,msg:WheelsEncoder) -> None:
 
         self.omega_left_sig     = msg.omega_left
         self.omega_right_sig    = msg.omega_right
@@ -278,12 +339,13 @@ class WheelDriverNode:
         if self.omega_right_ref == 0:
             self.throttle_right = 0
             self.omega_controller_right.reset()     
-        if not self.estop and not self.local_estop:
-            self.driver.set_wheels_throttle(left=self.throttle_left,right=self.throttle_right)
-        else:
-            self.driver.set_wheels_throttle(left=0,right=0)
-            self.omega_controller_left.reset()
-            self.omega_controller_right.reset()
+        with self.brake_lock:
+            if (not self.estop and not self.local_estop
+                    and not self.driver_estop and not self.collision_estop):
+                self.driver.set_wheels_throttle(
+                    left=self.throttle_left, right=self.throttle_right)
+            else:
+                self._stop_motors_locked()
 
         # Apply the yaw trim to the throttle
         self.throttle_left -= self.yaw_trim

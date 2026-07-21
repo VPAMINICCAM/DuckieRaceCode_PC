@@ -69,6 +69,8 @@ class LineFollower:
         self.button_r1 = 5
         self.last_joy_time = 0.0
         self.last_brake_sent = False
+        self.driver_brake_active = True
+        self.collision_brake_active = False
 
         self.z_min = 0.0
         self.z_max = 1.5
@@ -116,7 +118,12 @@ class LineFollower:
         # Publishers must exist before callbacks can attempt to use them.
         self.cmd_pub = rospy.Publisher("cmd_vel", Twist, queue_size=1)
         self.brake_pub = rospy.Publisher(
-            "/{}/local_brake".format(self.robot_name), Bool, queue_size=1)
+            "/{}/local_brake".format(self.robot_name), Bool,
+            queue_size=1, latch=True)
+        self.driver_brake_status_pub = rospy.Publisher(
+            "driver_brake_active", Bool, queue_size=1, latch=True)
+        self.collision_brake_status_pub = rospy.Publisher(
+            "collision_brake_active", Bool, queue_size=1, latch=True)
         self.power_pub = rospy.Publisher(
             "/{}/power_level".format(self.robot_name), Float32, queue_size=1)
         self.spd_pub = rospy.Publisher(
@@ -131,6 +138,9 @@ class LineFollower:
             "front_range", Range, self.tof_callback, queue_size=1)
         self.joy_sub = rospy.Subscriber(
             "joy", Joy, self.joy_callback, queue_size=1)
+        self.collision_brake_sub = rospy.Subscriber(
+            "collision_brake_cmd", Bool,
+            self.collision_brake_callback, queue_size=1)
         self.image_sub = rospy.Subscriber(
             "robot_cam/image_raw", Image, self.image_callback, queue_size=1)
         self.sub_wheel_enc = rospy.Subscriber(
@@ -148,6 +158,9 @@ class LineFollower:
             rospy.Duration(1.0), self.fuel_timer_callback)
 
         self.power_pub.publish(Float32(data=self.power_level))
+        self.collision_brake_status_pub.publish(
+            Bool(data=self.collision_brake_active))
+        self._publish_brake_state()
         control_owner = "robot" if self.autonomous_mode else "main-PC driver"
         rospy.loginfo(
             "Line follower node initialized; charging authority: %s",
@@ -168,6 +181,34 @@ class LineFollower:
             raw = self.z_max + 0.1
         self.tof_history.append(raw)
         self.tof_range = float(np.median(self.tof_history))
+
+    def collision_brake_callback(self, msg):
+        """Apply an idempotent supervisory brake command.
+
+        Anti-collision commands cannot safely use the joystick X edge because
+        X toggles state.  Mirroring the explicit desired state here also keeps
+        the legacy joystick toggle in sync for later charging commands.
+        """
+        self.collision_brake_active = bool(msg.data)
+        if not self.collision_brake_active and self.in_fuel_zone:
+            # Preserve the same safe lane-selection contract as B+X when a
+            # collision stop is released inside the fuel area.
+            self.red_mode_active = True
+        if self.collision_brake_active:
+            # Assert the motor-boundary owner before updating the shared local
+            # brake topic.  On release, do the inverse so one owner remains
+            # effective throughout either transition.
+            self.collision_brake_status_pub.publish(Bool(data=True))
+        self._publish_brake_state()
+        if not self.collision_brake_active:
+            self.collision_brake_status_pub.publish(Bool(data=False))
+
+    def _publish_brake_state(self):
+        """Publish the OR of independent driver and collision brake owners."""
+        self.brake_pub.publish(Bool(
+            data=self.driver_brake_active or self.collision_brake_active))
+        self.driver_brake_status_pub.publish(
+            Bool(data=self.driver_brake_active))
 
     def fuel_timer_callback(self, _event):
         if self.autonomous_mode:
@@ -245,7 +286,9 @@ class LineFollower:
     def brake_retry_callback(self, _event):
         if self.charging:
             return
-        self.brake_pub.publish(Bool(data=False))
+        self.driver_brake_active = False
+        self.last_brake_sent = True
+        self._publish_brake_state()
 
     def joy_callback(self, msg):
         now = time.time()
@@ -272,20 +315,23 @@ class LineFollower:
                 rospy.loginfo(
                     "Sending manual brake unlock to /%s/local_brake",
                     self.robot_name)
-                self.brake_pub.publish(Bool(data=False))
+                self.driver_brake_active = False
                 self.last_brake_sent = True
+                self._publish_brake_state()
             elif b_pressed:
                 rospy.loginfo(
                     "Sending manual brake unlock to /%s/local_brake "
                     "in fuel zone", self.robot_name)
-                self.brake_pub.publish(Bool(data=False))
+                self.driver_brake_active = False
                 self.last_brake_sent = True
+                self._publish_brake_state()
         elif x_pressed and self.last_brake_sent:
             rospy.loginfo(
                 "Sending manual brake lock to /%s/local_brake",
                 self.robot_name)
-            self.brake_pub.publish(Bool(data=True))
+            self.driver_brake_active = True
             self.last_brake_sent = False
+            self._publish_brake_state()
 
         if not self.autonomous_mode:
             self.charging = bool(y_pressed and self.in_fuel_zone)

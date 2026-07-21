@@ -8,9 +8,10 @@ selectable driving-behavior mode.  Designed to run on the main PC.
 Behavior Modes
 --------------
 MANUAL       - Virtual driver is inactive; physical joystick is used instead.
-CONSERVATIVE - Low speed, charges whenever inside the fuel zone.
+CONSERVATIVE - Low speed, charges whenever inside the fuel zone; slows and
+               brakes early for obstacles using the conservative safety gap.
 AGGRESSIVE   - Max speed, charges only when power is critically low;
-               slows / overtakes based on front range and charges when the
+               uses a tighter distance/TTC anti-collision profile and charges when the
                learned one-lap battery budget is no longer available.
 COOPERATIVE  - Medium speed, yields at obstacles, shares the fuel zone fairly
                with the other robots.
@@ -27,6 +28,8 @@ Subscribed topics (all absolute paths):
   /{robot_name}/in_charge_gate_zone Bool    Whether robot is at charge-gate entry
   /{robot_name}/in_merge_zone      Bool     Whether robot is in the merge zone
   /{robot_name}/front_range        Range    ToF distance to obstacle ahead
+  /{robot_name}/driver_brake_active Bool    Robot driver/charging brake owner
+  /{robot_name}/collision_brake_active Bool Robot acknowledgement of collision brake
   /{robot_name}/lap_count          Float32  Completed laps
   /{robot_name}/set_driving_mode   String   Runtime mode-change command
   /{other_robot}/power_level       Float32  Peer robots' power (cooperative mode)
@@ -37,6 +40,7 @@ Subscribed topics (all absolute paths):
 
 Published topics:
   /{robot_name}/joy                Joy      Synthetic joystick commands
+  /{robot_name}/collision_brake_cmd Bool    Idempotent anti-collision brake intent
   /{robot_name}/driving_mode       String   Active mode name (latched)
   /{robot_name}/aggressive_lap_energy Float32 Learned / conservative lap budget
   /{robot_name}/one_lap_required_power Float32 E + reserve for peer arbitration
@@ -50,6 +54,16 @@ Parameters
 ~driving_mode  str    default 'conservative'  Initial behavior mode
 ~all_robots    list   default [lucas,daisy]
 ~control_rate  float  default 2.0             Control-loop frequency [Hz]
+~anticollision_enabled bool default true       Enable front-range safety
+~anticollision_sensor_required bool default false Stop if range data is unavailable
+~anticollision_safety_rate float default 10.0  Sensor watchdog frequency [Hz]
+~conservative_safe_distance float default 0.55 Begin conservative slowdown [m]
+~conservative_emergency_distance float default 0.30 Conservative stop gap [m]
+~conservative_resume_distance float default 0.42 Conservative restart gap [m]
+~aggressive_safe_distance float default 0.45   Begin aggressive slowdown [m]
+~aggressive_emergency_distance float default 0.18 Aggressive stop gap [m]
+~aggressive_resume_distance float default 0.28 Aggressive restart gap [m]
+~front_range_stale_sec float default 1.0       Maximum usable range age [s]
 ~aggressive_battery_per_lap_default float default 70.0 Conservative first-lap prior
 ~aggressive_battery_reserve float default 10.0  Reserve retained after a lap
 ~aggressive_calibration_min_power float default 80.0 First-lap charge floor
@@ -61,6 +75,7 @@ import math
 import os
 import pickle
 import random
+import threading
 from sensor_msgs.msg import Joy, Range
 from std_msgs.msg import Bool, Float32, String, UInt32
 from enum import Enum
@@ -99,8 +114,11 @@ SPEED_START   = 0.25
 SPEED_STEP    = 0.02
 SPEED_MAX     = 0.35
 SPEED_MIN     = 0.20
+SPEED_CRAWL   = 0.15  # robot-side minimum, used only near an obstacle
 STEPS_TO_MAX  = int(round((SPEED_MAX - SPEED_START) / SPEED_STEP))  # 5
 STEPS_TO_MIN  = -int(round((SPEED_START - SPEED_MIN) / SPEED_STEP)) # -2
+STEPS_TO_CRAWL = -int(round(
+    (SPEED_START - SPEED_CRAWL) / SPEED_STEP))                       # -5
 STEPS_TO_HALF = 0  # 50% in the GUI speed scale maps to SPEED_START.
 
 # Power thresholds
@@ -117,13 +135,27 @@ COOP_CHARGE_PEER  = 30.0   # % - cooperative robot yields if peer < this
 OVERTAKE_DIST = 0.30        # activate yellow line to pass slow robot ahead
 YIELD_DIST    = 0.25        # slow down (cooperative yield)
 
-# Aggressive v1 tuning
+# Shared anti-collision supervision.  Conservative mode keeps a larger gap;
+# aggressive mode accepts a shorter gap but still brakes on low TTC.
+CONSERVATIVE_SAFE_DISTANCE = 0.55
+CONSERVATIVE_EMERGENCY_DISTANCE = 0.30
+CONSERVATIVE_RESUME_DISTANCE = 0.42
+CONSERVATIVE_TTC_SLOW = 2.5
+CONSERVATIVE_TTC_BRAKE = 1.2
+
 AGGRESSIVE_SAFE_DISTANCE = 0.45          # [m] begin slowing / overtaking
 AGGRESSIVE_EMERGENCY_DISTANCE = 0.18     # [m] lock brake if still closing
+AGGRESSIVE_RESUME_DISTANCE = 0.28        # [m] restart hysteresis threshold
 AGGRESSIVE_TTC_SLOW = 2.0                # [s] time-to-collision slow threshold
 AGGRESSIVE_TTC_BRAKE = 0.8               # [s] time-to-collision brake threshold
-AGGRESSIVE_RANGE_STALE_SEC = 1.0
-AGGRESSIVE_CLOSING_ALPHA = 0.35
+FRONT_RANGE_STALE_SEC = 1.0
+FRONT_CLOSING_ALPHA = 0.35
+ANTICOLLISION_COMMAND_RETRY_SEC = 0.8
+
+# Backwards-compatible names for code/tests that imported the aggressive v1
+# constants before anti-collision became a shared feature.
+AGGRESSIVE_RANGE_STALE_SEC = FRONT_RANGE_STALE_SEC
+AGGRESSIVE_CLOSING_ALPHA = FRONT_CLOSING_ALPHA
 # Start from the conservative result of the last race rather than gambling the
 # first learning lap on the old 20 % prior.  A completed uncharged lap replaces
 # this with the robot-specific estimate.
@@ -215,27 +247,37 @@ class DrivingStrategyBase:
         """Whether this strategy opts into the learned shared-charger policy."""
         return False
 
+    def anti_collision_mode(self, driver):
+        """Safety profile used independently of the charging policy."""
+        return DrivingMode.CONSERVATIVE
+
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
         return actions.idle()
 
     def decide(self, driver, actions: DriverActions) -> Joy:
         aggressive_policy = self.uses_aggressive_charge_policy(driver)
 
-        if driver.charge_state != ChargeState.IDLE:
+        if driver.charge_state == ChargeState.CHARGING:
             return actions.charge(
                 (driver.active_charge_target if aggressive_policy
                  else self.charge_target_power(driver)),
                 self.waits_for_merge_occupancy(driver))
 
-        # Hard emergency stop for non-aggressive modes.  Aggressive has its own
-        # TTC + distance safety logic inside normal_drive; skip the check there
-        # to avoid interfering with its more nuanced slow/overtake state machine.
-        if not aggressive_policy and not driver.local_brake:
-            if (driver.front_range_stamp is not None
-                    and rospy.Time.now().to_sec() - driver.front_range_stamp
-                    < AGGRESSIVE_RANGE_STALE_SEC
-                    and driver.tof_range < AGGRESSIVE_EMERGENCY_DISTANCE):
-                return actions.press(BTN_X)
+        # Collision avoidance is a safety concern, not a charging-policy
+        # concern.  Run the shared override before gate/merge motion so a car
+        # cannot bypass it while entering or leaving the charger.  An active
+        # charge keeps precedence because its intentional brake must not be
+        # released by the collision supervisor.
+        safety_joy = driver._anti_collision_override(
+            self.anti_collision_mode(driver), actions)
+        if safety_joy is not None:
+            return safety_joy
+
+        if driver.charge_state == ChargeState.LOCKING:
+            return actions.charge(
+                (driver.active_charge_target if aggressive_policy
+                 else self.charge_target_power(driver)),
+                self.waits_for_merge_occupancy(driver))
 
         # This persistent handoff state is specific to aggressive mode.  The
         # other strategies retain their existing simple charge-zone behavior.
@@ -300,6 +342,7 @@ class DrivingStrategyBase:
                 driver._begin_charge(self.charge_target_power(driver))
             else:
                 driver.charge_state = ChargeState.LOCKING
+                driver.charge_waiting_for_collision_clear = False
             return actions.charge(
                 (driver.active_charge_target if aggressive_policy
                  else self.charge_target_power(driver)),
@@ -380,10 +423,17 @@ class ConservativeStrategy(DrivingStrategyBase):
         return driver.power_level < CONSERVATIVE_CHARGE_START
 
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
-        return actions.speed_step_msg(STEPS_TO_MIN)
+        target_offset = (
+            STEPS_TO_CRAWL
+            if driver.anticollision_state == "slow"
+            else STEPS_TO_MIN)
+        return actions.speed_step_msg(target_offset)
 
 
 class AggressiveStrategy(DrivingStrategyBase):
+    def anti_collision_mode(self, driver):
+        return DrivingMode.AGGRESSIVE
+
     def uses_aggressive_charge_policy(self, driver) -> bool:
         return driver.mode == DrivingMode.AGGRESSIVE
 
@@ -409,21 +459,11 @@ class AggressiveStrategy(DrivingStrategyBase):
 
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
         buttons = [0] * 12
-        safety_state = driver._aggressive_front_safety_state()
-
-        if safety_state == "brake":
-            if not driver.local_brake:
-                return actions.press(BTN_X)
-            return actions.idle()
-
-        if driver.local_brake:
-            return actions.release_brake()
+        safety_state = driver.anticollision_state
 
         target_offset = STEPS_TO_MAX
         if safety_state == "slow":
             target_offset = 0
-            buttons[BTN_B] = 1
-        elif safety_state == "overtake":
             buttons[BTN_B] = 1
 
         driver._step_speed(target_offset, buttons)
@@ -447,6 +487,11 @@ class CooperativeStrategy(DrivingStrategyBase):
 
 
 class AdaptiveStrategy(DrivingStrategyBase):
+    def anti_collision_mode(self, driver):
+        if driver.power_level > 60.0:
+            return DrivingMode.AGGRESSIVE
+        return DrivingMode.CONSERVATIVE
+
     def wants_charge(self, driver) -> bool:
         return driver.power_level <= 60.0
 
@@ -528,6 +573,12 @@ class QLearningStrategy(DrivingStrategyBase):
         # call and corrupt last_action used by the Q-update next timestep.
         return self.chosen_action.get(driver.robot_name, "conservative") == "charge"
 
+    def anti_collision_mode(self, driver):
+        action = self.chosen_action.get(driver.robot_name, "conservative")
+        if action == "aggressive":
+            return DrivingMode.AGGRESSIVE
+        return DrivingMode.CONSERVATIVE
+
     def normal_drive(self, driver, actions: DriverActions) -> Joy:
         action = self.chosen_action.get(driver.robot_name, "conservative")
         if action == "aggressive":
@@ -590,6 +641,11 @@ class VirtualDriver:
     def __init__(self):
         rospy.init_node("virtual_driver_node")
 
+        # Range callbacks and the policy timer run on different rospy threads.
+        # Serialize each classify/command transition so an older clear result
+        # cannot overwrite a newer emergency-brake command.
+        self.anticollision_lock = threading.RLock()
+
         self.robot_name  = rospy.get_param("~robot_name", "daisy")
         mode_str         = rospy.get_param("~driving_mode", "conservative")
         all_robots       = rospy.get_param(
@@ -599,14 +655,57 @@ class VirtualDriver:
         self.charge_camera_names = rospy.get_param(
             "~charge_camera_names", ["usb_cam_1", "usb_cam_2"])
         self.control_rate = float(rospy.get_param("~control_rate", 2.0))
-        self.aggressive_safe_distance = float(rospy.get_param(
-            "~aggressive_safe_distance", AGGRESSIVE_SAFE_DISTANCE))
-        self.aggressive_emergency_distance = float(rospy.get_param(
-            "~aggressive_emergency_distance", AGGRESSIVE_EMERGENCY_DISTANCE))
-        self.aggressive_ttc_slow = float(rospy.get_param(
-            "~aggressive_ttc_slow", AGGRESSIVE_TTC_SLOW))
-        self.aggressive_ttc_brake = float(rospy.get_param(
-            "~aggressive_ttc_brake", AGGRESSIVE_TTC_BRAKE))
+        self.anticollision_enabled = bool(rospy.get_param(
+            "~anticollision_enabled", True))
+        self.anticollision_sensor_required = bool(rospy.get_param(
+            "~anticollision_sensor_required", False))
+        self.anticollision_safety_rate = max(1.0, float(rospy.get_param(
+            "~anticollision_safety_rate", 10.0)))
+        self.front_range_stale_sec = max(0.1, float(rospy.get_param(
+            "~front_range_stale_sec", FRONT_RANGE_STALE_SEC)))
+        self.front_closing_alpha = min(1.0, max(0.0, float(rospy.get_param(
+            "~front_closing_alpha", FRONT_CLOSING_ALPHA))))
+        self.anticollision_command_retry_sec = max(0.3, float(rospy.get_param(
+            "~anticollision_command_retry_sec",
+            ANTICOLLISION_COMMAND_RETRY_SEC)))
+
+        self.conservative_emergency_distance = max(0.01, float(
+            rospy.get_param(
+                "~conservative_emergency_distance",
+                CONSERVATIVE_EMERGENCY_DISTANCE)))
+        self.conservative_resume_distance = max(
+            self.conservative_emergency_distance,
+            float(rospy.get_param(
+                "~conservative_resume_distance",
+                CONSERVATIVE_RESUME_DISTANCE)))
+        self.conservative_safe_distance = max(
+            self.conservative_resume_distance,
+            float(rospy.get_param(
+                "~conservative_safe_distance",
+                CONSERVATIVE_SAFE_DISTANCE)))
+        self.conservative_ttc_brake = max(0.0, float(rospy.get_param(
+            "~conservative_ttc_brake", CONSERVATIVE_TTC_BRAKE)))
+        self.conservative_ttc_slow = max(
+            self.conservative_ttc_brake,
+            float(rospy.get_param(
+                "~conservative_ttc_slow", CONSERVATIVE_TTC_SLOW)))
+
+        self.aggressive_emergency_distance = max(0.01, float(rospy.get_param(
+            "~aggressive_emergency_distance", AGGRESSIVE_EMERGENCY_DISTANCE)))
+        self.aggressive_resume_distance = max(
+            self.aggressive_emergency_distance,
+            float(rospy.get_param(
+                "~aggressive_resume_distance", AGGRESSIVE_RESUME_DISTANCE)))
+        self.aggressive_safe_distance = max(
+            self.aggressive_resume_distance,
+            float(rospy.get_param(
+                "~aggressive_safe_distance", AGGRESSIVE_SAFE_DISTANCE)))
+        self.aggressive_ttc_brake = max(0.0, float(rospy.get_param(
+            "~aggressive_ttc_brake", AGGRESSIVE_TTC_BRAKE)))
+        self.aggressive_ttc_slow = max(
+            self.aggressive_ttc_brake,
+            float(rospy.get_param(
+                "~aggressive_ttc_slow", AGGRESSIVE_TTC_SLOW)))
         self.aggressive_battery_reserve = float(rospy.get_param(
             "~aggressive_battery_reserve", AGGRESSIVE_BATTERY_RESERVE))
         self.aggressive_battery_per_lap_estimate = float(rospy.get_param(
@@ -660,10 +759,12 @@ class VirtualDriver:
         self.in_merge_zone     = False
         self.tag_visible       = False
         self.local_brake       = True
+        self.driver_brake_active = True
         self.global_brake      = True    # True = game not running
         self.tof_range         = 9.9     # metres - default "clear"
         self.current_speed     = SPEED_START
         self.front_range_stamp = None
+        self.front_range_valid = False
         self.front_closing_speed = 0.0
         self.front_ttc         = float("inf")
         self.lap_count         = 0.0
@@ -701,10 +802,19 @@ class VirtualDriver:
         # ---- Internal driver state -------------------------------------------
         # Have we already sent the one-shot brake-release Joy message?
         self.brake_released    = False
+        # Collision brake ownership prevents the safety layer from unlocking a
+        # brake set by charging, the race controller, or a human operator.
+        self.anticollision_state = "unavailable"
+        self.anticollision_stop_latched = False
+        self.anticollision_brake_active = False
+        self.anticollision_brake_command_pending = False
+        self.anticollision_brake_last_sent = None
+        self.anticollision_release_pending = False
         # Current speed step offset, synchronised from /speed_percent when possible.
         # +N means N * L1 presses sent, -N means N * R1 presses sent.
         self.speed_offset      = 0
         self.charge_state      = ChargeState.IDLE
+        self.charge_waiting_for_collision_clear = False
         self.active_charge_target = POWER_CHARGE_FULL
         self.active_charge_target_reason = ""
         self.charge_session_count = 0
@@ -722,6 +832,9 @@ class VirtualDriver:
         # ---- Publishers -------------------------------------------------------
         self.joy_pub  = rospy.Publisher(
             f"/{self.robot_name}/joy", Joy, queue_size=1)
+        self.collision_brake_pub = rospy.Publisher(
+            f"/{self.robot_name}/collision_brake_cmd",
+            Bool, queue_size=1, latch=True)
         self.mode_pub = rospy.Publisher(
             f"/{self.robot_name}/driving_mode", String, queue_size=1, latch=True)
         # These latched topics let each driver compare the peer's *own* learned
@@ -747,6 +860,10 @@ class VirtualDriver:
                          Float32, self._cb_speed)
         rospy.Subscriber(f"/{self.robot_name}/local_brake",
                          Bool,    self._cb_local_brake)
+        rospy.Subscriber(f"/{self.robot_name}/driver_brake_active",
+                         Bool,    self._cb_driver_brake_status)
+        rospy.Subscriber(f"/{self.robot_name}/collision_brake_active",
+                         Bool,    self._cb_collision_brake_status)
         rospy.Subscriber(f"/{self.robot_name}/in_fuel_zone",
                          Bool,    self._cb_fuel_zone)
         rospy.Subscriber(f"/{self.robot_name}/in_charge_gate_zone",
@@ -803,6 +920,9 @@ class VirtualDriver:
 
         # ---- Control timer ----------------------------------------------------
         rospy.Timer(rospy.Duration(1.0 / self.control_rate), self._control_loop)
+        rospy.Timer(
+            rospy.Duration(1.0 / self.anticollision_safety_rate),
+            self._safety_watchdog)
 
         rospy.loginfo(
             f"[VirtualDriver/{self.robot_name}] "
@@ -827,7 +947,65 @@ class VirtualDriver:
             (self.current_speed - SPEED_START) / SPEED_STEP))
 
     def _cb_local_brake(self, msg: Bool):
-        self.local_brake = msg.data
+        with self.anticollision_lock:
+            self.local_brake = msg.data
+            if not msg.data and self.anticollision_release_pending:
+                self.anticollision_brake_active = False
+                self.anticollision_release_pending = False
+                self.anticollision_brake_last_sent = None
+            self._reconcile_driver_brake_owner()
+
+    def _reconcile_driver_brake_owner(self):
+        intentionally_stopped = (
+            self.global_brake
+            or self.mode == DrivingMode.MANUAL
+            or self.charge_state != ChargeState.IDLE
+            or self.waiting_for_fuel
+            or self.waiting_for_merge
+        )
+        if (
+                self.driver_brake_active
+                and self.local_brake
+                and self.brake_released
+                and not intentionally_stopped):
+            # The robot node starts with its driver owner engaged.  A
+            # mid-race robot restart must therefore re-enter the startup
+            # handshake instead of leaving normal driving stuck behind a
+            # newly recreated owner.  Requiring both owner and effective
+            # status makes this independent of cross-topic delivery order.
+            self.brake_released = False
+            rospy.logwarn(
+                "[VirtualDriver/%s] Driver brake owner reappeared; "
+                "reconciling startup state",
+                self.robot_name)
+
+    def _cb_driver_brake_status(self, msg: Bool):
+        """Track the independent joystick/charging brake owner."""
+        with self.anticollision_lock:
+            self.driver_brake_active = bool(msg.data)
+            self._reconcile_driver_brake_owner()
+
+    def _cb_collision_brake_status(self, msg: Bool):
+        """Reconcile ownership, including after either node restarts."""
+        with self.anticollision_lock:
+            if msg.data:
+                if self.mode == DrivingMode.MANUAL:
+                    self._set_collision_brake(False)
+                    self.anticollision_state = "unavailable"
+                    self.anticollision_stop_latched = False
+                    self.anticollision_brake_active = False
+                    self.anticollision_brake_command_pending = False
+                    self.anticollision_brake_last_sent = None
+                    self.anticollision_release_pending = False
+                    return
+                self.anticollision_brake_active = True
+                self.anticollision_stop_latched = True
+                self.anticollision_brake_command_pending = False
+            elif self.anticollision_release_pending:
+                self.anticollision_brake_active = False
+                self.anticollision_brake_command_pending = False
+                self.anticollision_release_pending = False
+                self.anticollision_brake_last_sent = None
 
     def _cb_fuel_zone(self, msg: Bool):
         self.in_fuel_zone = msg.data
@@ -852,33 +1030,82 @@ class VirtualDriver:
         self.tag_visible = msg.data
 
     def _cb_tof(self, msg: Range):
+        with self.anticollision_lock:
+            self._cb_tof_locked(msg)
+
+    def _cb_tof_locked(self, msg: Range):
         now = rospy.Time.now().to_sec()
         new_range = msg.range
 
-        if not math.isfinite(new_range) or new_range <= 0.0:
+        too_close = (
+            (math.isinf(new_range) and new_range < 0.0)
+            or (math.isfinite(new_range) and new_range <= 0.0)
+        )
+        if too_close:
+            # REP-117 defines -Inf as closer than min_range.  Some sensors also
+            # report zero for saturation; both must fail toward an immediate
+            # stop rather than being confused with an invalid/clear return.
+            new_range = max(0.0, float(
+                getattr(msg, "min_range", 0.0) or 0.0))
+        elif not math.isfinite(new_range):
             self.tof_range = 9.9
             self.front_range_stamp = now
+            self.front_range_valid = False
             self.front_closing_speed = 0.0
             self.front_ttc = float("inf")
+            self._react_to_front_range()
             return
 
-        if self.front_range_stamp is not None:
+        if self.front_range_valid and self.front_range_stamp is not None:
             dt = now - self.front_range_stamp
-            if dt > 1.0e-3:
+            if 1.0e-3 < dt <= self.front_range_stale_sec:
                 instant_closing = max(0.0, (self.tof_range - new_range) / dt)
-                alpha = AGGRESSIVE_CLOSING_ALPHA
+                alpha = self.front_closing_alpha
                 self.front_closing_speed = (
                     (1.0 - alpha) * self.front_closing_speed
                     + alpha * instant_closing
                 )
                 if self.front_closing_speed > 1.0e-2:
-                    margin = max(0.0, new_range - self.aggressive_safe_distance)
-                    self.front_ttc = margin / self.front_closing_speed
+                    # Standard time to contact.  The former calculation used
+                    # distance-to-the-slow-boundary, which collapsed TTC to zero
+                    # for every decreasing sample already inside that boundary.
+                    self.front_ttc = new_range / self.front_closing_speed
                 else:
                     self.front_ttc = float("inf")
+            else:
+                self.front_closing_speed = 0.0
+                self.front_ttc = float("inf")
+        else:
+            # Never differentiate across invalid or missing samples: a clear
+            # sentinel followed by a valid return would look like an enormous
+            # closing velocity and cause a false emergency stop.
+            self.front_closing_speed = 0.0
+            self.front_ttc = float("inf")
 
         self.tof_range = new_range
         self.front_range_stamp = now
+        self.front_range_valid = True
+        self._react_to_front_range()
+
+    def _react_to_front_range(self):
+        """Assert emergency braking at sensor rate; release at policy rate."""
+        if (
+                getattr(self, "global_brake", True)
+                or getattr(self, "mode", DrivingMode.MANUAL) == DrivingMode.MANUAL
+                or getattr(self, "charge_state", ChargeState.IDLE)
+                == ChargeState.CHARGING):
+            return
+        strategy = STRATEGIES.get(self.mode)
+        if strategy is None:
+            return
+        self._anti_collision_override(
+            strategy.anti_collision_mode(self),
+            self.actions,
+            allow_release=False)
+
+    def _safety_watchdog(self, _event):
+        """Detect a required sensor becoming stale even without new callbacks."""
+        self._react_to_front_range()
 
     def _cb_lap_count(self, msg: Float32):
         # The lap-energy model is meaningful only for the aggressive driving
@@ -931,6 +1158,10 @@ class VirtualDriver:
         self.last_lap_count = new_lap_count
 
     def _cb_global_brake(self, msg: Bool):
+        with self.anticollision_lock:
+            return self._cb_global_brake_locked(msg)
+
+    def _cb_global_brake_locked(self, msg: Bool):
         if msg.data and not self.global_brake:
             # Game just stopped - lock local brake if it is currently released.
             if not self.local_brake:
@@ -940,6 +1171,7 @@ class VirtualDriver:
             self.brake_released = False
             self.speed_offset   = 0
             self.charge_state   = ChargeState.IDLE
+            self.charge_waiting_for_collision_clear = False
             self.active_charge_target = POWER_CHARGE_FULL
             self.active_charge_target_reason = ""
             self.charge_lock_last_sent = None
@@ -967,6 +1199,10 @@ class VirtualDriver:
         self._reset_aggressive_learning()
 
     def _cb_set_mode(self, msg: String):
+        with self.anticollision_lock:
+            return self._cb_set_mode_locked(msg)
+
+    def _cb_set_mode_locked(self, msg: String):
         try:
             new_mode = DrivingMode(msg.data.strip().lower())
         except ValueError:
@@ -981,6 +1217,7 @@ class VirtualDriver:
             self.brake_released = False   # re-release brake on mode change
             self.speed_offset   = 0
             self.charge_state   = ChargeState.IDLE
+            self.charge_waiting_for_collision_clear = False
             self.active_charge_target = POWER_CHARGE_FULL
             self.active_charge_target_reason = ""
             self.charge_lock_last_sent = None
@@ -990,6 +1227,19 @@ class VirtualDriver:
             self.merge_release_sent = False
             self.seeking_fuel = False
             self.leaving_charge = False
+            if (
+                    self.mode == DrivingMode.MANUAL
+                    and self.anticollision_brake_active):
+                # MANUAL promises full physical-joystick control.  Relinquish
+                # only the brake owned by this supervisor and synchronize the
+                # robot's idempotent collision-command state.
+                self._set_collision_brake(False)
+                self.anticollision_state = "unavailable"
+                self.anticollision_stop_latched = False
+                self.anticollision_brake_active = False
+                self.anticollision_brake_command_pending = False
+                self.anticollision_brake_last_sent = None
+                self.anticollision_release_pending = False
             rospy.loginfo(
                 f"[VirtualDriver/{self.robot_name}] Mode -> {self.mode.value}")
             self.mode_pub.publish(String(data=self.mode.value))
@@ -1065,6 +1315,10 @@ class VirtualDriver:
         msg.buttons  = buttons if buttons is not None else [0] * 12
         msg.axes     = axes    if axes    is not None else [0.0] * 8
         return msg
+
+    def _set_collision_brake(self, engaged: bool):
+        """Publish an idempotent desired state for the supervisory brake."""
+        self.collision_brake_pub.publish(Bool(data=bool(engaged)))
 
     def _joy_press(self, *button_indices) -> Joy:
         """Return a Joy message with specified buttons pressed, all others 0."""
@@ -1177,6 +1431,7 @@ class VirtualDriver:
 
     def _begin_charge(self, target_power: float):
         self.charge_state = ChargeState.LOCKING
+        self.charge_waiting_for_collision_clear = False
         self.active_charge_target = min(
             POWER_CHARGE_FULL, max(0.0, float(target_power)))
         self.active_charge_target_reason = (
@@ -1413,36 +1668,193 @@ class VirtualDriver:
                 return True
         return False
 
-    def _aggressive_front_safety_state(self) -> str:
-        if self.front_range_stamp is None:
-            return "clear"
-
-        age = rospy.Time.now().to_sec() - self.front_range_stamp
-        if age > AGGRESSIVE_RANGE_STALE_SEC:
-            return "clear"
-
-        if self.tof_range <= self.aggressive_emergency_distance:
-            return "brake"
-
-        if (
-            self.front_closing_speed > 1.0e-2
-            and self.front_ttc <= self.aggressive_ttc_brake
-        ):
-            return "brake"
-
-        if (
-            self.tof_range <= self.aggressive_safe_distance
-            or (
-                self.front_closing_speed > 1.0e-2
-                and self.front_ttc <= self.aggressive_ttc_slow
+    def _front_safety_thresholds(self, profile):
+        """Return (slow, stop, resume, ttc_slow, ttc_stop) for a mode."""
+        if profile == DrivingMode.AGGRESSIVE:
+            return (
+                getattr(self, "aggressive_safe_distance",
+                        AGGRESSIVE_SAFE_DISTANCE),
+                getattr(self, "aggressive_emergency_distance",
+                        AGGRESSIVE_EMERGENCY_DISTANCE),
+                getattr(self, "aggressive_resume_distance",
+                        AGGRESSIVE_RESUME_DISTANCE),
+                getattr(self, "aggressive_ttc_slow", AGGRESSIVE_TTC_SLOW),
+                getattr(self, "aggressive_ttc_brake", AGGRESSIVE_TTC_BRAKE),
             )
-        ):
+        return (
+            getattr(self, "conservative_safe_distance",
+                    CONSERVATIVE_SAFE_DISTANCE),
+            getattr(self, "conservative_emergency_distance",
+                    CONSERVATIVE_EMERGENCY_DISTANCE),
+            getattr(self, "conservative_resume_distance",
+                    CONSERVATIVE_RESUME_DISTANCE),
+            getattr(self, "conservative_ttc_slow", CONSERVATIVE_TTC_SLOW),
+            getattr(self, "conservative_ttc_brake", CONSERVATIVE_TTC_BRAKE),
+        )
+
+    def _front_safety_state(self, profile, allow_release: bool = True) -> str:
+        """Classify a fresh front-range sample using the selected mode profile.
+
+        A missing optional sensor is reported unavailable so a known
+        sensor-less robot can still run; a required sensor fails closed.  Once
+        this supervisor has asserted a collision brake, stale/invalid data also
+        keeps that owned brake locked until a fresh clear sample arrives.
+        """
+        if not getattr(self, "anticollision_enabled", True):
+            self.anticollision_stop_latched = False
+            return "clear"
+
+        stamp = getattr(self, "front_range_stamp", None)
+        valid = getattr(self, "front_range_valid", stamp is not None)
+        if not valid or stamp is None:
+            if getattr(self, "anticollision_sensor_required", False):
+                self.anticollision_stop_latched = True
+                return "brake"
+            return "unavailable"
+
+        stale_sec = getattr(
+            self, "front_range_stale_sec", FRONT_RANGE_STALE_SEC)
+        if rospy.Time.now().to_sec() - stamp > stale_sec:
+            if getattr(self, "anticollision_sensor_required", False):
+                self.anticollision_stop_latched = True
+                return "brake"
+            return "unavailable"
+
+        slow_distance, stop_distance, resume_distance, ttc_slow, ttc_stop = (
+            self._front_safety_thresholds(profile))
+        distance = getattr(self, "tof_range", float("inf"))
+        closing_speed = getattr(self, "front_closing_speed", 0.0)
+        ttc = getattr(self, "front_ttc", float("inf"))
+
+        # A larger release threshold prevents a noisy sample around the stop
+        # boundary from toggling the brake on every 2 Hz control tick.  Once it
+        # is crossed, return clear for one cycle so the owned brake can release;
+        # the next cycle may classify the same gap as slow.
+        if getattr(self, "anticollision_stop_latched", False):
+            if distance < resume_distance:
+                return "brake"
+            if closing_speed > 1.0e-2 and ttc <= ttc_stop:
+                return "brake"
+            if not allow_release:
+                return "brake"
+            self.anticollision_stop_latched = False
+            return "clear"
+
+        if distance <= stop_distance:
+            self.anticollision_stop_latched = True
+            return "brake"
+        if closing_speed > 1.0e-2 and ttc <= ttc_stop:
+            self.anticollision_stop_latched = True
+            return "brake"
+        if distance <= slow_distance:
             return "slow"
-
-        if self.tof_range < OVERTAKE_DIST:
-            return "overtake"
-
+        if closing_speed > 1.0e-2 and ttc <= ttc_slow:
+            return "slow"
         return "clear"
+
+    def _aggressive_front_safety_state(self) -> str:
+        """Compatibility wrapper for callers of the aggressive v1 helper."""
+        return self._front_safety_state(DrivingMode.AGGRESSIVE)
+
+    def _anti_collision_override(
+            self,
+            profile,
+            actions: DriverActions,
+            allow_release: bool = True):
+        with self.anticollision_lock:
+            return self._anti_collision_override_locked(
+                profile, actions, allow_release)
+
+    def _anti_collision_override_locked(
+            self,
+            profile,
+            actions: DriverActions,
+            allow_release: bool = True):
+        """Return a Joy override for collision braking, or ``None``.
+
+        Collision intent uses a dedicated Bool command because joystick BTN_X
+        is a toggle and cannot be retried safely.  Ownership still ensures that
+        this supervisor only releases a brake it asserted itself.
+        """
+        state = self._front_safety_state(
+            profile, allow_release=allow_release)
+        self.anticollision_state = state
+        active = getattr(self, "anticollision_brake_active", False)
+        pending = getattr(
+            self, "anticollision_brake_command_pending", False)
+        release_pending = getattr(
+            self, "anticollision_release_pending", False)
+
+        if state == "unavailable":
+            if not active and not getattr(
+                    self, "anticollision_stop_latched", False):
+                return None
+            # Sensor loss may never clear a previously observed hazard.  Keep
+            # asserting the dedicated owner even when another owner already
+            # makes /local_brake appear true.
+            state = "brake"
+
+        if state == "brake":
+            now = rospy.Time.now().to_sec()
+            last_sent = getattr(self, "anticollision_brake_last_sent", None)
+            retry_sec = getattr(
+                self,
+                "anticollision_command_retry_sec",
+                ANTICOLLISION_COMMAND_RETRY_SEC)
+            if active and not pending and not release_pending:
+                return actions.idle()
+            if (
+                    pending
+                    and not release_pending
+                    and last_sent is not None
+                    and now - last_sent < retry_sec):
+                return actions.idle()
+
+            self.anticollision_brake_active = True
+            self.anticollision_brake_command_pending = True
+            self.anticollision_release_pending = False
+            self.anticollision_brake_last_sent = now
+            self._set_collision_brake(True)
+            if not active or release_pending:
+                rospy.loginfo(
+                    "[VirtualDriver/%s] Anti-collision brake: %s profile, %.2f m",
+                    self.robot_name,
+                    profile.value,
+                    self.tof_range)
+            return actions.idle()
+
+        if active:
+            # The stop latch has cleared, so both "clear" and "slow" are safe
+            # release states.  Continue retrying the idempotent clear command
+            # if the gap remains between the resume and slowdown thresholds.
+            self.anticollision_brake_command_pending = False
+            now = rospy.Time.now().to_sec()
+            last_sent = getattr(
+                self, "anticollision_brake_last_sent", None)
+            retry_sec = getattr(
+                self,
+                "anticollision_command_retry_sec",
+                ANTICOLLISION_COMMAND_RETRY_SEC)
+            if (release_pending and last_sent is not None
+                    and now - last_sent < retry_sec):
+                if self.in_fuel_zone or self.leaving_charge:
+                    return actions.hold_yellow_line()
+                return actions.idle()
+            # collision_brake_active is the authoritative owner status.
+            # Publish the desired clear state even if /local_brake currently
+            # reads false: that effective OR topic can lag the latched owner
+            # acknowledgement during reconnect/startup ordering.
+            self.anticollision_release_pending = True
+            self.anticollision_brake_last_sent = now
+            self._set_collision_brake(False)
+            rospy.loginfo(
+                "[VirtualDriver/%s] Anti-collision clear, releasing brake",
+                self.robot_name)
+            if self.in_fuel_zone or self.leaving_charge:
+                return actions.hold_yellow_line()
+            return actions.idle()
+
+        return None
 
     def _charge_gate_control_msg(self) -> Joy:
         return self._joy_press(BTN_B)
@@ -1536,6 +1948,33 @@ class VirtualDriver:
             if self.power_level >= target_power:
                 if wait_for_merge and self._merge_zone_occupied_by_other():
                     return self._merge_wait_msg()
+
+                strategy = STRATEGIES.get(self.mode)
+                profile = (
+                    strategy.anti_collision_mode(self)
+                    if strategy is not None
+                    else DrivingMode.CONSERVATIVE)
+                completion_safety = self._front_safety_state(profile)
+                self.anticollision_state = completion_safety
+                if (
+                        completion_safety == "brake"
+                        or (
+                            self.charge_waiting_for_collision_clear
+                            and completion_safety != "clear"
+                        )):
+                    # Keep the existing charging/driver brake owner instead of
+                    # transferring it across ROS topics.  This preserves the
+                    # OR-composed brake contract atomically and waits for a
+                    # fresh clear sample before sending the usual B+X release.
+                    if not self.charge_waiting_for_collision_clear:
+                        rospy.loginfo(
+                            "[VirtualDriver/%s] Charge complete; waiting for clear path",
+                            self.robot_name)
+                    self.charge_waiting_for_collision_clear = True
+                    return self._joy_press(BTN_B)
+
+                self.charge_waiting_for_collision_clear = False
+
                 self.charge_state = ChargeState.IDLE
                 if self.mode == DrivingMode.AGGRESSIVE:
                     self.charge_session_count += 1
@@ -1550,7 +1989,8 @@ class VirtualDriver:
                 self.leaving_charge = True
                 self.active_charge_target = POWER_CHARGE_FULL
                 self.active_charge_target_reason = ""
-                rospy.loginfo(f"[VirtualDriver/{self.robot_name}] Charge complete, releasing brake")
+                rospy.loginfo(
+                    f"[VirtualDriver/{self.robot_name}] Charge complete, releasing brake")
                 return self._joy_press(BTN_B, BTN_X)
             return self._joy_press(BTN_Y)
 
@@ -1561,6 +2001,10 @@ class VirtualDriver:
     # ==========================================================================
 
     def _control_loop(self, _event):
+        with self.anticollision_lock:
+            return self._control_loop_locked(_event)
+
+    def _control_loop_locked(self, _event):
         # MANUAL mode: leave the physical joystick in full control
         if self.mode == DrivingMode.MANUAL:
             return
@@ -1569,8 +2013,51 @@ class VirtualDriver:
         if self.global_brake:
             return
 
+        strategy = STRATEGIES.get(self.mode)
+        if strategy is None:
+            return
+
         # --- One-shot brake release at game start ----------------------------
         if not self.brake_released:
+            profile = strategy.anti_collision_mode(self)
+            startup_safety = self._front_safety_state(profile)
+            self.anticollision_state = startup_safety
+
+            if (
+                    startup_safety == "unavailable"
+                    and self.anticollision_stop_latched):
+                joy_msg = self._anti_collision_override(profile, self.actions)
+                if joy_msg is not None:
+                    self.joy_pub.publish(joy_msg)
+                self.brake_released = not self.driver_brake_active
+                return
+
+            # Do not create a one-tick motion window at race start or after a
+            # mode switch.  Assert the dedicated collision owner even if an
+            # independent owner already makes the effective brake read true.
+            if startup_safety == "brake":
+                joy_msg = self._anti_collision_override(
+                    profile, self.actions)
+                if joy_msg is not None:
+                    self.joy_pub.publish(joy_msg)
+                # A collision owner is now asserted independently of the
+                # effective local brake.  Startup only remains pending when
+                # the robot reports a separate driver/charging owner too.
+                self.brake_released = not self.driver_brake_active
+                rospy.loginfo(
+                    "[VirtualDriver/%s] Start held by anti-collision (%s)",
+                    self.robot_name,
+                    profile.value)
+                return
+
+            # A mode change can happen while this supervisor owns a brake.  It
+            # must complete that owned release before generic startup handling.
+            if self.anticollision_brake_active:
+                joy_msg = self._anti_collision_override(profile, self.actions)
+                if joy_msg is not None:
+                    self.joy_pub.publish(joy_msg)
+                    return
+
             if self.local_brake:
                 joy_msg = self._release_brake_msg()
                 self.joy_pub.publish(joy_msg)
@@ -1581,10 +2068,6 @@ class VirtualDriver:
                     f"[VirtualDriver/{self.robot_name}] Brake already released for '{self.mode.value}' mode")
             self.brake_released = True
             # Give duckierace.py one cycle (debounce window) before next command
-            return
-
-        strategy = STRATEGIES.get(self.mode)
-        if strategy is None:
             return
 
         self._publish_charge_status()

@@ -3,6 +3,7 @@
 
 import ast
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -18,6 +19,22 @@ CONTROLLERS = (
     SRC_ROOT / "vpa_duckierace/scripts/virtual_driver_node.py",
     SRC_ROOT / "vpa_duckierace/scripts/keyboard_joy_console.py",
     SRC_ROOT / "vpa_duckierace/q_table/driver_node.py",
+)
+VIRTUAL_DRIVER_LAUNCH = SRC_ROOT / "vpa_duckierace/launch/virtual_driver.launch"
+ANTICOLLISION_PARAMS = (
+    "anticollision_enabled",
+    "anticollision_safety_rate",
+    "front_range_stale_sec",
+    "conservative_safe_distance",
+    "conservative_emergency_distance",
+    "conservative_resume_distance",
+    "conservative_ttc_slow",
+    "conservative_ttc_brake",
+    "aggressive_safe_distance",
+    "aggressive_emergency_distance",
+    "aggressive_resume_distance",
+    "aggressive_ttc_slow",
+    "aggressive_ttc_brake",
 )
 
 
@@ -43,6 +60,30 @@ class JoyButtonContractTests(unittest.TestCase):
                     name: assignments.get(name) for name in EXPECTED_BUTTONS
                 }
                 self.assertEqual(EXPECTED_BUTTONS, actual)
+
+    def test_anticollision_profiles_are_wired_to_both_virtual_drivers(self):
+        launch = ET.parse(VIRTUAL_DRIVER_LAUNCH).getroot()
+        launch_args = {item.get("name") for item in launch.findall("arg")}
+        self.assertTrue(set(ANTICOLLISION_PARAMS).issubset(launch_args))
+
+        driver_nodes = [
+            node for node in launch.findall("node")
+            if node.get("type") == "virtual_driver_node.py"
+        ]
+        self.assertEqual(2, len(driver_nodes))
+        for node in driver_nodes:
+            with self.subTest(node=node.get("name")):
+                params = {
+                    item.get("name"): item.get("value")
+                    for item in node.findall("param")
+                }
+                for name in ANTICOLLISION_PARAMS:
+                    self.assertEqual("$(arg {})".format(name), params.get(name))
+                robot = "lucas" if "lucas" in node.get("name") else "daisy"
+                self.assertEqual(
+                    "$(arg {}_anticollision_sensor_required)".format(robot),
+                    params.get("anticollision_sensor_required"),
+                )
 
 
 if __name__ == "__main__":

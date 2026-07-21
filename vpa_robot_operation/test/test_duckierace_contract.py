@@ -83,10 +83,14 @@ class DuckieRaceDeploymentContractTests(unittest.TestCase):
             "charging",
             "real_spd",
             "last_joy_time",
+            "driver_brake_active",
+            "collision_brake_active",
             "autonomous_mode",
             "want_charge",
             "cmd_pub",
             "brake_pub",
+            "driver_brake_status_pub",
+            "collision_brake_status_pub",
             "power_pub",
             "spd_pub",
         )
@@ -117,6 +121,26 @@ class DuckieRaceDeploymentContractTests(unittest.TestCase):
             self.assertIsInstance(assignment.value, ast.Constant)
             self.assertEqual(value, assignment.value.value)
             self.assertIn(name, assignments)
+
+    def test_collision_brake_uses_an_idempotent_bool_command(self):
+        self.assertIn('"collision_brake_cmd", Bool', self.source)
+        self.assertIn('"driver_brake_active", Bool', self.source)
+        self.assertIn(
+            "data=self.driver_brake_active or self.collision_brake_active",
+            self.source,
+        )
+        self.assertIn(
+            "self.collision_brake_status_pub.publish(",
+            self.source,
+        )
+        self.assertIn("Bool(data=self.collision_brake_active)", self.source)
+        self.assertIn(
+            "self.driver_brake_status_pub.publish(", self.source)
+        self.assertIn(
+            '"/{}/local_brake".format(self.robot_name), Bool,\n'
+            "            queue_size=1, latch=True)",
+            self.source,
+        )
 
     def test_lost_line_branch_publishes_an_explicit_stop(self):
         line_follower = next(

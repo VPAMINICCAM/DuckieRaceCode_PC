@@ -206,4 +206,8 @@ include_directories(
 # endif()
 
 ## Add folders to be run by python nosetests
-# catkin_add_nosetests(test)
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_control_contracts.py)
+  catkin_add_nosetests(test/test_virtual_driver_anticollision.py)
+  catkin_add_nosetests(test/test_virtual_driver_charging.py)
+endif()
